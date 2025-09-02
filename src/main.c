@@ -8,7 +8,7 @@
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
 /* LED0 for feedback */
-static const struct gpio_dt_spec rock_pin = GPIO_DT_SPEC_GET(DT_ALIAS(rock), gpios);
+static const struct gpio_dt_spec rock_pin = GPIO_DT_SPEC_GET(DT_ALIAS(trigger0), gpios);
 
 
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -22,8 +22,21 @@ static struct gpio_callback button_cb;
 
 int turned_on = 0;
 
-void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
+/*
+
+dts addon (under button child), LED working w this way:
+
+	gpio_trigger {
+		compatible = "gpio-leds";
+		trigger_pin: trigger_0 {
+			gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+			label = "Wakeup Trigger Pin";
+		};
+	};
+*/
+
+//void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+/*{
     printk(" Button was pressed!\n");
 
     // Turn on LED0
@@ -33,13 +46,13 @@ void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t
     gpio_pin_set_dt(&rock_pin, turned_on);
     
     turned_on = !turned_on;
-}
+}*/
 
 int main(void)
 {
     int ret;
 
-    ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+    /*ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
     if (ret < 0) {
         printk(" Failed to configure button pin: %d\n", ret);
         return 0;
@@ -48,30 +61,30 @@ int main(void)
     if (!device_is_ready(led1.port)) {
         printk(" LED device %s not ready\n", led1.port->name);
         return 0;
-    }
+    }*/
 
     if (!device_is_ready(rock_pin.port)) {
-        printk(" LED device %s not ready\n", led1.port->name);
-        return 0;
-    }
-
-    ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT);
-    if (ret < 0) {
-        printk(" Failed to configure LED: %d\n", ret);
+        printk("Rockpin %s not ready\n", led1.port->name);
         return 0;
     }
 
     ret = gpio_pin_configure_dt(&rock_pin, GPIO_OUTPUT);
     if (ret < 0) {
-        printk(" Failed to configure LED: %d\n", ret);
+        printk(" Failed to configure rockpin: %d\n", ret);
         return 0;
     }
 
-    gpio_pin_set_dt(&led1, 0);  // Off
-    gpio_pin_set_dt(&rock_pin, 0);  // Off
+    /*ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT);
+    if (ret < 0) {
+        printk(" Failed to configure LED: %d\n", ret);
+        return 0;
+    }*/
+
+    //gpio_pin_set_dt(&led1, 0);  // Off
+    gpio_pin_set_dt(&rock_pin, 1);  // on
 
     // === 3. Setup Interrupt ===
-    gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
+    /*gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
     ret = gpio_add_callback(button.port, &button_cb);
     if (ret < 0) {
         printk(" Failed to add callback: %d\n", ret);
@@ -82,7 +95,7 @@ int main(void)
     if (ret < 0) {
         printk(" Failed to configure interrupt: %d\n", ret);
         return 0;
-    }
+    }*/
 
 
     return 0;
