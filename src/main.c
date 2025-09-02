@@ -3,16 +3,12 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/kernel.h>
+#include <hal/nrf_power.h>
 
-/* Button 1 (SW1) */
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
-
-/* LED0 for feedback */
 static const struct gpio_dt_spec rock_pin = GPIO_DT_SPEC_GET(DT_ALIAS(trigger0), gpios);
-
-
-static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios); // to know button changes
 
 
 #define MIN_PERIOD PWM_SEC(1U) / 128U
@@ -35,33 +31,45 @@ dts addon (under button child), LED working w this way:
 	};
 */
 
-//void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-/*{
-    printk(" Button was pressed!\n");
+void go_to_sleep(void)
+{
+    printk("Going to system off...\n");
+    gpio_pin_set_dt(&rock_pin, 0); // LED off
+    k_sleep(K_MSEC(250));
+    nrf_power_system_off(NRF_POWER); //deepsleep func
+}
 
-    // Turn on LED0
-    gpio_pin_set_dt(&led1, turned_on);
-    
-    // Turn on ROCK ;)
-    gpio_pin_set_dt(&rock_pin, turned_on);
-    
+void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    printk("Button pressed!\n");
+
+    if (turned_on) { 
+        go_to_sleep();
+    } else {
+        gpio_pin_set_dt(&rock_pin, 1);
+    }
+
     turned_on = !turned_on;
-}*/
+}
 
 int main(void)
 {
     int ret;
 
-    /*ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
-    if (ret < 0) {
-        printk(" Failed to configure button pin: %d\n", ret);
+    // led1 setup
+
+    if (!device_is_ready(led1.port)) {
+        printk("LED device %s not ready\n", led1.port->name);
         return 0;
     }
 
-    if (!device_is_ready(led1.port)) {
-        printk(" LED device %s not ready\n", led1.port->name);
+    ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT);
+    if (ret < 0) {
+        printk("Failed to configure LED: %d\n", ret);
         return 0;
-    }*/
+    }
+
+    // rock pin setup
 
     if (!device_is_ready(rock_pin.port)) {
         printk("Rockpin %s not ready\n", led1.port->name);
@@ -70,21 +78,25 @@ int main(void)
 
     ret = gpio_pin_configure_dt(&rock_pin, GPIO_OUTPUT);
     if (ret < 0) {
-        printk(" Failed to configure rockpin: %d\n", ret);
+        printk("Failed to configure rockpin: %d\n", ret);
         return 0;
     }
 
-    /*ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT);
-    if (ret < 0) {
-        printk(" Failed to configure LED: %d\n", ret);
-        return 0;
-    }*/
 
     //gpio_pin_set_dt(&led1, 0);  // Off
-    gpio_pin_set_dt(&rock_pin, 1);  // on
+    //gpio_pin_set_dt(&rock_pin, 1);  // on
 
-    // === 3. Setup Interrupt ===
-    /*gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
+
+    // button setup & interrupt
+
+    ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+
+    if (ret < 0) {
+        printk("Failed to configure button button: %d\n", ret);
+        return 0;
+    }
+
+    gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
     ret = gpio_add_callback(button.port, &button_cb);
     if (ret < 0) {
         printk(" Failed to add callback: %d\n", ret);
@@ -95,8 +107,11 @@ int main(void)
     if (ret < 0) {
         printk(" Failed to configure interrupt: %d\n", ret);
         return 0;
-    }*/
+    }
 
+    gpio_pin_set_dt(&led1, 1); 
+    gpio_pin_set_dt(&rock_pin, 1); 
+    turned_on = 1;                 
 
     return 0;
 }
