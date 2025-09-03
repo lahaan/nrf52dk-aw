@@ -24,28 +24,16 @@ const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0)); // [P0.06 - TX]
 #define MAX_PERIOD PWM_SEC(1U)
 
 static struct gpio_callback button_cb;
+static struct gpio_callback wake_cb;
 static struct k_work rock_pulse_work;
 
 int turned_on = 0;
-
-/*
-
-dts addon (under button child), LED working w this way:
-
-	gpio_trigger {
-		compatible = "gpio-leds";
-		trigger_pin: trigger_0 {
-			gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
-			label = "Wakeup Trigger Pin";
-		};
-	};
-*/
 
 // A separate handler for triggering pin (rock sbc) due to ISR/Zepyhr not liking delays/sleeps in it
 void rock_pulse_handler(struct k_work *work)
 {
     gpio_pin_set_dt(&rock_pin, true);
-    k_sleep(K_MSEC(70));
+    k_sleep(K_MSEC(100));
     gpio_pin_set_dt(&rock_pin, false);
 }
 
@@ -66,72 +54,159 @@ void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t
 
 }
 
-int main(void)
+void wake_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) //ISR
 {
-    int ret;
+    printk("Voltage has been detected via wake pin!\n");
+}
 
+int initialize_pins(void){
+    int ret;
     //initialize uart
     if (!device_is_ready(uart0)) {
         printk("UART device not found!\n");
-        return 0;
-    }
-    //sample: uart_poll_out(uart0, 'message');
+        return ret;
+    } //sample: uart_poll_out(uart0, 'message');
 
     // led1 setup
-
     if (!device_is_ready(led1.port)) {
         printk("LED device %s not ready\n", led1.port->name);
-        return 0;
+        return ret;
     }
 
     ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT);
     if (ret < 0) {
         printk("Failed to configure LED: %d\n", ret);
-        return 0;
+        return ret;
     }
 
     // rock pin setup
-
     if (!device_is_ready(rock_pin.port)) {
-        printk("Rockpin %s not ready\n", led1.port->name);
-        return 0;
+        printk("Rockpin %s not ready\n", rock_pin.port->name);
+        return ret;
     }
 
     ret = gpio_pin_configure_dt(&rock_pin, GPIO_OUTPUT);
     if (ret < 0) {
         printk("Failed to configure rockpin: %d\n", ret);
-        return 0;
+        return ret;
     }
 
+    // modem pin setup
+    if (!device_is_ready(modem_pin.port)) {
+        printk("modem_pin %s not ready\n", modem_pin.port->name);
+        return ret;
+    }
 
-    //gpio_pin_set_dt(&led1, 0);  // Off
-    // button setup & interrupt
+    ret = gpio_pin_configure_dt(&modem_pin, GPIO_OUTPUT);
+    if (ret < 0) {
+        printk("Failed to configure modem_pin: %d\n", ret);
+        return ret;
+    }
 
+    // wake pin setup
+    ret = gpio_pin_configure_dt(&wake_pin, GPIO_INPUT);
+
+    if (ret < 0) {
+        printk("Failed to configure wake_pin: %d\n", ret);
+        return ret;
+    }
+
+    gpio_init_callback(&wake_cb, wake_pressed, BIT(wake_pin.pin));
+    ret = gpio_add_callback(wake_pin.port, &wake_cb);
+    if (ret < 0) {
+        printk("Failed to add callback: %d\n", ret);
+        return ret;
+    }
+
+    ret = gpio_pin_interrupt_configure_dt(&wake_pin, GPIO_INT_EDGE_TO_ACTIVE);
+    if (ret < 0) {
+        printk("Failed to configure interrupt: %d\n", ret);
+        return ret;
+    }
+
+    // button setup
     ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
 
     if (ret < 0) {
         printk("Failed to configure button button: %d\n", ret);
-        return 0;
+        return ret;
     }
 
     gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
     ret = gpio_add_callback(button.port, &button_cb);
     if (ret < 0) {
-        printk(" Failed to add callback: %d\n", ret);
-        return 0;
+        printk("Failed to add callback: %d\n", ret);
+        return ret;
     }
 
     ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
     if (ret < 0) {
-        printk(" Failed to configure interrupt: %d\n", ret);
+        printk("Failed to configure interrupt: %d\n", ret);
+        return ret;
+    }
+}
+
+int main(void)
+{
+    if (initialize_pins() < 0) {
+        printk("Failed to initialize pins\n");
         return 0;
     }
 
     k_work_init(&rock_pulse_work, rock_pulse_handler); //rock pulse initialization
 
     gpio_pin_set_dt(&led1, 1); 
-    gpio_pin_set_dt(&rock_pin, 0); 
+    gpio_pin_set_dt(&rock_pin, 0);
+    gpio_pin_set_dt(&modem_pin, 0); 
     turned_on = 1;                 
 
     return 0;
 }
+
+
+/*
+dts (just in case):
+under button child: 
+	gpio_trigger {
+		compatible = "gpio-leds";
+		trigger_pin: trigger_0 {
+			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+			label = "Wakeup Trigger Pin"; //sbc wakeup
+		};
+		trigger_pin2: trigger_1 {
+			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+			label = "Wakeup Trigger Pin 2"; //modem wakeup
+		};
+
+	};
+
+	gpio_wake {
+		compatible = "gpio-keys";
+		wakeup-source;
+		wake_pin: wake_pin {
+			gpios = <&gpio0 28 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Wakeup Pin"; //sbc interrupting sbc for wake
+			zephyr,code = <INPUT_KEY_4>;
+		};
+	};
+
+added to alias (ofc):
+		trigger0 = &trigger_pin;
+		trigger1 = &trigger_pin2;
+		wakepin = &wake_pin;
+
+Kconfig (granted pwm is not needed):
+CONFIG_STDOUT_CONSOLE=y
+CONFIG_PRINTK=y
+CONFIG_PWM=y
+CONFIG_LOG=y
+CONFIG_LOG_PRINTK=y
+CONFIG_LOG_MODE_IMMEDIATE=y
+CONFIG_PWM_LOG_LEVEL_DBG=y
+CONFIG_PM=y
+CONFIG_PM_DEVICE=y
+CONFIG_SERIAL=y
+CONFIG_UART_CONSOLE=y
+
+
+*/
