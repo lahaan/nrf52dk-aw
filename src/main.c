@@ -32,9 +32,9 @@ int turned_on = 0;
 // A separate handler for triggering pin (rock sbc) due to ISR/Zepyhr not liking delays/sleeps in it
 void rock_pulse_handler(struct k_work *work)
 {
-    gpio_pin_set_dt(&rock_pin, true);
-    k_sleep(K_MSEC(100));
     gpio_pin_set_dt(&rock_pin, false);
+    k_sleep(K_MSEC(100));
+    gpio_pin_set_dt(&rock_pin, true);
 }
 
 void go_to_sleep(void)
@@ -156,7 +156,7 @@ int main(void)
     k_work_init(&rock_pulse_work, rock_pulse_handler); //rock pulse initialization
 
     gpio_pin_set_dt(&led1, 1); 
-    gpio_pin_set_dt(&rock_pin, 0);
+    gpio_pin_set_dt(&rock_pin, 1);
     gpio_pin_set_dt(&modem_pin, 0); 
     turned_on = 1;                 
 
