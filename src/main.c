@@ -15,6 +15,7 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 #define MAX_PERIOD PWM_SEC(1U)
 
 static struct gpio_callback button_cb;
+static struct k_work rock_pulse_work;
 
 int turned_on = 0;
 
@@ -30,26 +31,29 @@ dts addon (under button child), LED working w this way:
 		};
 	};
 */
+// A separate handler for triggering pin (rock sbc) due to ISR/Zepyhr not liking delays/sleeps in it
+void rock_pulse_handler(struct k_work *work)
+{
+    gpio_pin_set_dt(&rock_pin, true);
+    k_sleep(K_MSEC(70));
+    gpio_pin_set_dt(&rock_pin, false);
+}
 
 void go_to_sleep(void)
 {
     printk("Going to system off...\n");
-    gpio_pin_set_dt(&rock_pin, 0); // LED off
     k_sleep(K_MSEC(250));
     nrf_power_system_off(NRF_POWER); //deepsleep func
 }
 
-void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) //ISR
 {
-    printk("Button pressed!\n");
 
-    if (turned_on) { 
-        go_to_sleep();
-    } else {
-        gpio_pin_set_dt(&rock_pin, 1);
-    }
-
+    printk("STATE %s:\n", turned_on ? "HIGH (1)" : "LOW (0)");
+    k_work_submit(&rock_pulse_work); //rock pulse
+    gpio_pin_set_dt(&led1, turned_on);
     turned_on = !turned_on;
+
 }
 
 int main(void)
@@ -84,9 +88,6 @@ int main(void)
 
 
     //gpio_pin_set_dt(&led1, 0);  // Off
-    //gpio_pin_set_dt(&rock_pin, 1);  // on
-
-
     // button setup & interrupt
 
     ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
@@ -109,8 +110,10 @@ int main(void)
         return 0;
     }
 
+    k_work_init(&rock_pulse_work, rock_pulse_handler); //rock pulse initialization
+
     gpio_pin_set_dt(&led1, 1); 
-    gpio_pin_set_dt(&rock_pin, 1); 
+    gpio_pin_set_dt(&rock_pin, 0); 
     turned_on = 1;                 
 
     return 0;
