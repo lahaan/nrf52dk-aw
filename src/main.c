@@ -28,6 +28,20 @@ static struct gpio_callback wake_cb;
 static struct k_work rock_pulse_work;
 
 int turned_on = 0;
+int counter = 0;
+
+void send_message(void)
+{
+    //send message via uart
+    const char *msg = "FENT!\n";
+    uart_poll_out(uart0, '0' + counter);
+    for (int i = 0; msg[i] != '\0'; i++) {
+        uart_poll_out(uart0, msg[i]);
+    }
+    counter++;
+    if (counter > 9) counter = 0;
+    printk("Sent msg\n");
+}
 
 // A separate handler for triggering pin (rock sbc) due to ISR/Zepyhr not liking delays/sleeps in it
 void rock_pulse_handler(struct k_work *work)
@@ -35,6 +49,7 @@ void rock_pulse_handler(struct k_work *work)
     gpio_pin_set_dt(&rock_pin, false);
     k_sleep(K_MSEC(100));
     gpio_pin_set_dt(&rock_pin, true);
+    send_message();
 }
 
 void go_to_sleep(void)
@@ -152,6 +167,10 @@ int main(void)
         printk("Failed to initialize pins\n");
         return 0;
     }
+
+
+    //uart_poll_in(uart0, NULL);
+    //uart_poll_out(uart0, 'message');
 
     k_work_init(&rock_pulse_work, rock_pulse_handler); //rock pulse initialization
 

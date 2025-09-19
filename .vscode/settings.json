@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "nrf_gpio.h": "c"
+        "nrf_gpio.h": "c",
+        "socket.h": "c"
     }
 }
