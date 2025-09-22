@@ -1,11 +1,12 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <hal/nrf_power.h>
 #include <zephyr/drivers/uart.h>
+
+#include <ctype.h>
 
 //on board
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -19,9 +20,10 @@ static const struct gpio_dt_spec wake_pin = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), 
 //IoT/modem related (external):
 const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0)); // [P0.06 - TX] [P0.08 - RX]
 
+#define RX_BUF_SIZE 64
+static uint8_t rx_buf[RX_BUF_SIZE];
 
-#define MIN_PERIOD PWM_SEC(1U) / 128U
-#define MAX_PERIOD PWM_SEC(1U)
+static struct k_work_delayable led1_off_work;
 
 static struct gpio_callback button_cb;
 static struct gpio_callback wake_cb;
@@ -29,6 +31,63 @@ static struct k_work rock_pulse_work;
 
 int turned_on = 0;
 int counter = 0;
+
+static void led1_off_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    gpio_pin_set_dt(&led1, 0);
+}
+
+/* Async UART callback: blink LED when bytes arrive */
+
+static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    switch (evt->type) {
+    case UART_RX_RDY: {
+        /* Grab the new bytes */
+        const uint8_t *p = &evt->data.rx.buf[evt->data.rx.offset];
+        size_t l = evt->data.rx.len;
+
+        /* Blink (your existing lines) */
+        gpio_pin_set_dt(&led1, 1);
+        k_work_reschedule(&led1_off_work, K_MSEC(50));
+
+        /* ---- Print what we got ---- */
+        printk("RX[%u] HEX: ", (unsigned)l);
+        for (size_t i = 0; i < l; ++i) {
+            printk("%02X ", p[i]);
+        }
+        printk(" | ASCII: |");
+        for (size_t i = 0; i < l; ++i) {
+            printk("%c", isprint(p[i]) ? p[i] : '.');
+        }
+        printk("|\n");
+        break;
+    }
+
+    case UART_RX_BUF_REQUEST:
+        /* OK to ignore in this simple single-buffer setup */
+        break;
+
+    case UART_RX_DISABLED:
+        /* Re-enable if buffer filled */
+        uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), 50);
+        break;
+
+    case UART_RX_STOPPED:
+        /* Recover on error/stop */
+        uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), 50);
+        break;
+
+    default:
+        break;
+    }
+}
+
+
 
 void send_message(void)
 {
@@ -79,13 +138,13 @@ int initialize_pins(void){
     //initialize uart
     if (!device_is_ready(uart0)) {
         printk("UART device not found!\n");
-        return ret;
+        return -ENODEV;
     } //sample: uart_poll_out(uart0, 'message');
 
     // led1 setup
     if (!device_is_ready(led1.port)) {
         printk("LED device %s not ready\n", led1.port->name);
-        return ret;
+        return -ENODEV;
     }
 
     ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT);
@@ -97,7 +156,7 @@ int initialize_pins(void){
     // rock pin setup
     if (!device_is_ready(rock_pin.port)) {
         printk("Rockpin %s not ready\n", rock_pin.port->name);
-        return ret;
+        return -ENODEV;
     }
 
     ret = gpio_pin_configure_dt(&rock_pin, GPIO_OUTPUT);
@@ -109,7 +168,7 @@ int initialize_pins(void){
     // modem pin setup
     if (!device_is_ready(modem_pin.port)) {
         printk("modem_pin %s not ready\n", modem_pin.port->name);
-        return ret;
+        return -ENODEV;
     }
 
     ret = gpio_pin_configure_dt(&modem_pin, GPIO_OUTPUT);
@@ -120,7 +179,6 @@ int initialize_pins(void){
 
     // wake pin setup
     ret = gpio_pin_configure_dt(&wake_pin, GPIO_INPUT);
-
     if (ret < 0) {
         printk("Failed to configure wake_pin: %d\n", ret);
         return ret;
@@ -168,6 +226,9 @@ int main(void)
         return 0;
     }
 
+    k_work_init_delayable(&led1_off_work, led1_off_work_handler);
+    uart_callback_set(uart0, uart_evt_cb, NULL);
+    uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), 50);
 
     //uart_poll_in(uart0, NULL);
     //uart_poll_out(uart0, 'message');
@@ -209,10 +270,24 @@ under button child:
 		};
 	};
 
-added to alias (ofc):
+	aliases {
+		led0 = &led0;
+		led1 = &led1;
+		led2 = &led2;
+		led3 = &led3;
+		pwm-led0 = &pwm_led0;
+		sw0 = &button0;
+		sw1 = &button1;
+		sw2 = &button2;
+		sw3 = &button3;
+		bootloader-led0 = &led0;
+		mcuboot-button0 = &button0;
+		mcuboot-led0 = &led0;
+		watchdog0 = &wdt0;
 		trigger0 = &trigger_pin;
 		trigger1 = &trigger_pin2;
 		wakepin = &wake_pin;
+	};
 
 Kconfig (granted pwm is not needed):
 CONFIG_STDOUT_CONSOLE=y
