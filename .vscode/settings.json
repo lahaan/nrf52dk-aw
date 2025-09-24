@@ -1,6 +1,10 @@
 {
     "files.associations": {
         "nrf_gpio.h": "c",
-        "socket.h": "c"
+        "socket.h": "c",
+        "nrf_modem_lib.h": "c",
+        "ctype.h": "c",
+        "net_if.h": "c",
+        "uart.h": "c"
     }
 }
