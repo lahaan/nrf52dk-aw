@@ -1,560 +1,394 @@
+/* - successful connection v0.1 - HTTP */
+/* note, SHREAD broken a. reply - 29/9 */
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/kernel.h>
-#include <hal/nrf_power.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/gpio.h>
+#include <string.h>
+#include <stdlib.h> // for atoi
 
-//networking
-#include <zephyr/net/socket.h>
-#include <zephyr/net/net_if.h>
-#include <zephyr/net/net_mgmt.h>
-
-
-#include <ctype.h>
-
-
-
-//on board
+// UART & Button
+const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0));
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
-static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
-static const struct gpio_dt_spec button3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
-static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios); // to know button changes
 
-//external wirings (modem wake, rock sbc trigger, sbc interrupt to wake)
-static const struct gpio_dt_spec rock_pin = GPIO_DT_SPEC_GET(DT_ALIAS(trigger0), gpios);  // [P0.11] interrupt sbc
-//static const struct gpio_dt_spec modem_pin = GPIO_DT_SPEC_GET(DT_ALIAS(trigger1), gpios); // [P0.12] wake modem [REDACTED]
-static const struct gpio_dt_spec wake_pin = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios);   // [P0.28] interrupt from sbc
-//static const struct gpio_dt_spec mdm_pn = GPIO_DT_SPEC_GET(DT_ALIAS(modem), mdm-power-gpios); //Zmodem power pin [P0.02]
-
-//IoT/modem related (external):
-const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0)); // [P0.06 - TX] [P0.08 - RX]
-
-#define RX_BUF_SIZE 64
+#define RX_BUF_SIZE 128
+static int32_t RX_TIMEOUT_DELAY = 200;
 static uint8_t rx_buf[RX_BUF_SIZE];
+static char response_buf[RX_BUF_SIZE];
+static size_t resp_len = 0;
+static bool response_complete = false;
+static bool waiting_for_response = false;
+static bool last_command_successful = false;
+static int last_http_data_size = 0; // NEW: Store HTTP response data size
 
-#define CONNECT_TIMEOUT_MS 15000
+// Button work
+static struct k_work button_work;
+static void button_pressed(struct k_work *work);
 
-static struct net_mgmt_event_callback if_cb;
-static volatile bool if_up = false;
+// Forward decls
+void send_at_command(const char *cmd);
+void run_http_test(void);
+void run_communication_test(void);
 
-static struct k_work_delayable led1_off_work;
-
-static struct gpio_callback button_cb;
-static struct gpio_callback wake_cb;
-static struct k_work rock_pulse_work;
-
-static struct gpio_callback button2_cb;
-static struct gpio_callback button3_cb;
-static struct k_work button2_work;
-static struct k_work button3_work;
-
-int turned_on = 0;
-int counter = 0;
-
-
-static void iface_event_handler(struct net_mgmt_event_callback *cb,
-                                uint32_t mgmt_event, struct net_if *iface)
-{
-    if (mgmt_event == NET_EVENT_IF_UP || mgmt_event == NET_EVENT_L4_CONNECTED) {
-        if_up = true;
-    }
-}
-
-static int wait_net_up(int timeout_ms)
-{
-    net_mgmt_init_event_callback(&if_cb, iface_event_handler,
-                                 NET_EVENT_IF_UP | NET_EVENT_L4_CONNECTED);
-    net_mgmt_add_event_callback(&if_cb);
-
-    int waited = 0;
-    while (!if_up && waited < timeout_ms) {
-        k_msleep(100);
-        waited += 100;
-    }
-    net_mgmt_del_event_callback(&if_cb);
-    return if_up ? 0 : -ETIMEDOUT;
-}
-
-static int http_smoke_test(void)
-{
-    int rc = wait_net_up(CONNECT_TIMEOUT_MS);
-    if (rc) {
-        printk("Network did not come up (%d)\n", rc);
-        return rc;
-    }
-    printk("Network is up. Trying TCP to example.com:80\n");
-
-    int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s < 0) {
-        printk("socket() failed: %d\n", errno);
-        return -errno;
-    }
-
-    struct sockaddr_in dst = {
-        .sin_family = AF_INET,
-        .sin_port   = htons(80),
-        .sin_addr   = { .s_addr = htonl(0x5DB8D822) } // 93.184.216.34
-    };
-
-    rc = connect(s, (struct sockaddr *)&dst, sizeof(dst));
-    if (rc < 0) {
-        printk("connect() failed: %d\n", errno);
-        close(s);
-        return -errno;
-    }
-
-    const char req[] =
-        "GET / HTTP/1.0\r\nHost: example.com\r\nUser-Agent: zephyr-test\r\n\r\n";
-    rc = send(s, req, sizeof(req) - 1, 0);
-    if (rc < 0) {
-        printk("send() failed: %d\n", errno);
-        close(s);
-        return -errno;
-    }
-
-    char buf[256];
-    rc = recv(s, buf, sizeof(buf) - 1, 0);
-    if (rc > 0) {
-        buf[rc] = '\0';
-        printk("HTTP response (%d bytes):\n%.*s\n", rc, rc, buf);
-    } else {
-        printk("recv() returned %d (errno=%d)\n", rc, errno);
-    }
-
-    close(s);
-    return 0;
-}
-
-
-static void led1_off_work_handler(struct k_work *work)
-{
-    ARG_UNUSED(work);
-    gpio_pin_set_dt(&led1, 0);
-}
-
-
-static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+// UART callback - Updated to parse HTTP response data size
+static void uart_evt_cb(const struct device *dev, struct uart_event *evt, struct uart_event *user_data)
 {
     ARG_UNUSED(dev);
     ARG_UNUSED(user_data);
 
     switch (evt->type) {
     case UART_RX_RDY: {
-        /* Grab the new bytes */
         const uint8_t *p = &evt->data.rx.buf[evt->data.rx.offset];
         size_t l = evt->data.rx.len;
 
-        // blink led1 when rx arrives
-        gpio_pin_set_dt(&led1, 1);
-        k_work_reschedule(&led1_off_work, K_MSEC(50));
+        for (size_t i = 0; i < l; i++) {
+            char c = p[i];
 
-        printk("|\n");
+            if (c == '\r' || c == '\n') {
+                if (resp_len > 0) {
+                    response_buf[resp_len] = '\0';
+                    printk("<<< %s\n", response_buf);
+
+                    // Check for response indicators
+                    if (strcmp(response_buf, "OK") == 0) {
+                        response_complete = true;
+                        waiting_for_response = false;
+                        last_command_successful = true;
+                    } else if (strcmp(response_buf, "ERROR") == 0 ||
+                               strcmp(response_buf, "NO CARRIER") == 0 ||
+                               strcmp(response_buf, "NO DIALTONE") == 0 ||
+                               strcmp(response_buf, "NO ANSWER") == 0 ||
+                               strcmp(response_buf, "NO") == 0 ||
+                               strstr(response_buf, "+CME ERROR:") != NULL ||
+                               strstr(response_buf, "+SHREQ:") != NULL && strstr(response_buf, "ERROR") != NULL) {
+                        response_complete = true;
+                        waiting_for_response = false;
+                        last_command_successful = false;
+                    } 
+                    // NEW: Parse HTTP response data size from SHREQ response
+                    else if (strstr(response_buf, "+SHREQ:") != NULL) {
+                        // Example: +SHREQ:"POST",200,457
+                        char *comma1 = strchr(response_buf, ','); // First comma after method
+                        if (comma1) {
+                            char *comma2 = strchr(comma1 + 1, ','); // Second comma before data size
+                            if (comma2) {
+                                // Extract the data size number after the second comma
+                                char *data_size_str = comma2 + 1;
+                                last_http_data_size = atoi(data_size_str);
+                                printk("<<< Parsed HTTP response data size: %d\n", last_http_data_size);
+                            }
+                        }
+                    }
+
+                    resp_len = 0;
+                }
+            } else {
+                if (resp_len < sizeof(response_buf) - 1) {
+                    response_buf[resp_len++] = c;
+                } else {
+                    printk("<<< Buffer overflow, resetting buffer. Received char: '%c'\n", c);
+                    resp_len = 0;
+                }
+            }
+        }
         break;
     }
-
-    case UART_RX_BUF_REQUEST:
-        /* OK to ignore in this simple single-buffer setup */
-        break;
-
     case UART_RX_DISABLED:
-        /* Re-enable if buffer filled */
-        uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), 50);
+        uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), RX_TIMEOUT_DELAY);
         break;
 
     case UART_RX_STOPPED:
-        /* Recover on error/stop */
-        uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), 50);
+        uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), RX_TIMEOUT_DELAY);
         break;
-
     default:
         break;
     }
 }
 
-void sw2_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    printk("BUTTON 2 pressed → trying network test\n");
-    k_work_submit(&button2_work);
+void send_at_command(const char *cmd) {
+    printk(">>> %s\n", cmd);
+    for (int i = 0; cmd[i] != '\0'; i++) {
+        uart_poll_out(uart0, cmd[i]);
+    }
+    uart_poll_out(uart0, '\r');
+    uart_poll_out(uart0, '\n');
 }
 
-void sw3_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    printk("BUTTON 3 pressed → network OFF\n");
-    k_work_submit(&button3_work);
+void wait_for_response(k_timeout_t timeout) {
+    response_complete = false;
+    waiting_for_response = true;
+    last_http_data_size = 0; // Reset HTTP data size when waiting for new response
+
+    printk("Waiting for response for up to %d seconds...\n", timeout.ticks);
+
+    int64_t start = k_uptime_get();
+    while (waiting_for_response && (k_uptime_get() - start) < timeout.ticks * 1000) {
+        k_msleep(10);
+    }
+
+    if (waiting_for_response) {
+        printk("<<< (timeout waiting for response)\n");
+        waiting_for_response = false;
+        last_command_successful = false;
+    } else {
+        printk("<<< Response received within timeout.\n");
+    }
+
+    if (resp_len > 0) {
+        response_buf[resp_len] = '\0';
+        printk("<<< Leftover buffer after wait: '%s'\n", response_buf);
+        resp_len = 0;
+    }
 }
 
-void sw2_work_handler(struct k_work *work)
+static void button_pressed(struct k_work *work)
 {
-    printk("Bringing up network...\n");
-    struct net_if *iface = net_if_get_default();
-    net_if_up(iface);
-    http_smoke_test();
+    ARG_UNUSED(work);
+    printk("\n--- BUTTON PRESSED: Running Communication Test ---\n");
+    run_communication_test();
 }
 
-void sw3_work_handler(struct k_work *work)
+void run_communication_test(void)
 {
-    printk("Bringing network down...\n");
-    struct net_if *iface = net_if_get_default();
-    net_if_down(iface);
+    printk("--- Starting Communication Test ---\n");
+
+    send_at_command("AT");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("ATI");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CGMR");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CGMI");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("ATE1");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("ATE0");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    printk("--- Communication Test Complete ---\n");
+    printk("--- Now Running HTTP Test ---\n");
+    run_http_test();
 }
 
-
-void send_message(void)
+void run_http_test(void)
 {
-    //send message via uart
-    const char *msg = "FENT!\n";
-    uart_poll_out(uart0, '0' + counter);
-    for (int i = 0; msg[i] != '\0'; i++) {
-        uart_poll_out(uart0, msg[i]);
+    printk("--- Starting HTTP Test ---\n");
+
+    send_at_command("AT");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("ATE0");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CPIN?");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CGREG=1");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CGREG?");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CGATT?");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CSQ");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CPSI?");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"");
+    wait_for_response(K_SECONDS(3));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CNACT=0,1");
+    wait_for_response(K_SECONDS(10));
+    k_sleep(K_SECONDS(2));
+
+    send_at_command("AT+CNACT?");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+CGREG?");
+    wait_for_response(K_SECONDS(2));
+    k_sleep(K_SECONDS(1));
+
+    send_at_command("AT+SHCONF=\"URL\",\"http://httpbin.org\"");
+    wait_for_response(K_SECONDS(2));
+
+    send_at_command("AT+SHCONF=\"BODYLEN\",1024");
+    wait_for_response(K_SECONDS(2));
+
+    send_at_command("AT+SHCONF=\"HEADERLEN\",350");
+    wait_for_response(K_SECONDS(2));
+
+    printk("Waiting for network to stabilize...\n");
+    for (int j = 0; j < 30; j++){
+        printk(".");
+        k_sleep(K_SECONDS(1));
     }
-    counter++;
-    if (counter > 9) counter = 0;
-    printk("Sent msg\n");
+    printk("\n");
+
+    send_at_command("AT+CGATT?");
+    wait_for_response(K_SECONDS(2));
+    send_at_command("AT+CNACT?");
+    wait_for_response(K_SECONDS(2));
+
+    send_at_command("AT+SHCONN");
+    wait_for_response(K_SECONDS(20));
+    k_sleep(K_SECONDS(2));
+
+    send_at_command("AT+SHSTATE?");
+    wait_for_response(K_SECONDS(2));
+
+    if (last_command_successful) {
+        printk("AT+SHCONN successful, proceeding with HTTP request.\n");
+        
+        send_at_command("AT+SHCHEAD");
+        wait_for_response(K_SECONDS(2));
+
+        send_at_command("AT+SHAHEAD=\"User-Agent\",\"nRF52-SIM7080\"");
+        wait_for_response(K_SECONDS(2));
+
+        send_at_command("AT+SHAHEAD=\"Cache-control\",\"no-cache\"");
+        wait_for_response(K_SECONDS(2));
+
+        send_at_command("AT+SHAHEAD=\"Connection\",\"keep-alive\"");
+        wait_for_response(K_SECONDS(2));
+
+        send_at_command("AT+SHAHEAD=\"Accept\",\"*/*\"");
+        wait_for_response(K_SECONDS(2));
+
+        send_at_command("AT+SHAHEAD=\"Content-Type\",\"application/json\"");
+        wait_for_response(K_SECONDS(2));
+
+        const char *post_data = "{\"msg\":\"Hello from nRF52 via SIM7080!\"}";
+        char shbod_cmd[50];
+        snprintf(shbod_cmd, sizeof(shbod_cmd), "AT+SHBOD=%d,5000", strlen(post_data));
+        send_at_command(shbod_cmd);
+        wait_for_response(K_SECONDS(3));
+
+        if (last_command_successful) {
+            for (int i = 0; post_data[i] != '\0'; i++) {
+                uart_poll_out(uart0, post_data[i]);
+            }
+            uart_poll_out(uart0, 0x1A);
+            printk(">>> Sent HTTP body + CTRL+Z\n");
+
+            send_at_command("AT+SHREQ=\"/post\",3");
+            wait_for_response(K_SECONDS(20)); // This will parse the data size
+            
+            // NEW: Read the response using the actual data size returned by SHREQ
+            if (last_command_successful && last_http_data_size > 0) {
+                char shread_cmd[30];
+                snprintf(shread_cmd, sizeof(shread_cmd), "AT+SHREAD=0,%d", last_http_data_size);
+                send_at_command(shread_cmd);
+                wait_for_response(K_SECONDS(5));
+            } else if (last_command_successful) {
+                // Fallback if no size was parsed
+                send_at_command("AT+SHREAD=0,500");
+                wait_for_response(K_SECONDS(5));
+            }
+        }
+
+        send_at_command("AT+SHDISC");
+        wait_for_response(K_SECONDS(5));
+    } else {
+        printk("AT+SHCONN failed (last_command_successful=%d), skipping subsequent HTTP commands.\n", last_command_successful);
+        
+        printk("Checking network status again...\n");
+        send_at_command("AT+CGREG?");
+        wait_for_response(K_SECONDS(2));
+        send_at_command("AT+CGATT?");
+        wait_for_response(K_SECONDS(2));
+        send_at_command("AT+CNACT?");
+        wait_for_response(K_SECONDS(2));
+        send_at_command("AT+SHSTATE?");
+        wait_for_response(K_SECONDS(2));
+    }
+
+    printk("--- HTTP test complete ---\n");
 }
 
-// A separate handler for triggering pin (rock sbc) due to ISR/Zepyhr not liking delays/sleeps in it
-void rock_pulse_handler(struct k_work *work)
+static void button_cb(const struct device *dev, struct gpio_callback *cb,
+                      uint32_t pins)
 {
-    gpio_pin_set_dt(&rock_pin, false);
-    k_sleep(K_MSEC(100));
-    gpio_pin_set_dt(&rock_pin, true);
-    send_message();
-}
-
-void go_to_sleep(void)
-{
-    printk("Going to system off...\n");
-    k_sleep(K_MSEC(250));
-    nrf_power_system_off(NRF_POWER); //deepsleep func
-}
-
-void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) //ISR
-{
-
-    printk("STATE %s:\n", turned_on ? "HIGH (1)" : "LOW (0)");
-    k_work_submit(&rock_pulse_work); //rock pulse
-    gpio_pin_set_dt(&led1, turned_on);
-    turned_on = !turned_on;
-
-}
-
-void wake_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) //ISR
-{
-    printk("Voltage has been detected via wake pin!\n");
-}
-
-int initialize_pins(void){
-    int ret;
-    //initialize uart
-    if (!device_is_ready(uart0)) {
-        printk("UART device not found!\n");
-        return -ENODEV;
-    } //sample: uart_poll_out(uart0, 'message');
-
-    // led1 setup
-    if (!device_is_ready(led1.port)) {
-        printk("LED device %s not ready\n", led1.port->name);
-        return -ENODEV;
-    }
-
-    ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT);
-    if (ret < 0) {
-        printk("Failed to configure LED: %d\n", ret);
-        return ret;
-    }
-
-    // rock pin setup
-    if (!device_is_ready(rock_pin.port)) {
-        printk("Rockpin %s not ready\n", rock_pin.port->name);
-        return -ENODEV;
-    }
-
-    ret = gpio_pin_configure_dt(&rock_pin, GPIO_OUTPUT);
-    if (ret < 0) {
-        printk("Failed to configure rockpin: %d\n", ret);
-        return ret;
-    }
-
-    // modem pin setup
-    /*if (!device_is_ready(modem_pin.port)) {
-        printk("modem_pin %s not ready\n", modem_pin.port->name);
-        return -ENODEV;
-    }
-
-    ret = gpio_pin_configure_dt(&modem_pin, GPIO_OUTPUT);
-    if (ret < 0) {
-        printk("Failed to configure modem_pin: %d\n", ret);
-        return ret;
-    }*/
-
-    // wake pin setup
-    ret = gpio_pin_configure_dt(&wake_pin, GPIO_INPUT);
-    if (ret < 0) {
-        printk("Failed to configure wake_pin: %d\n", ret);
-        return ret;
-    }
-
-    gpio_init_callback(&wake_cb, wake_pressed, BIT(wake_pin.pin));
-    ret = gpio_add_callback(wake_pin.port, &wake_cb);
-    if (ret < 0) {
-        printk("Failed to add callback: %d\n", ret);
-        return ret;
-    }
-
-    ret = gpio_pin_interrupt_configure_dt(&wake_pin, GPIO_INT_EDGE_TO_ACTIVE);
-    if (ret < 0) {
-        printk("Failed to configure interrupt: %d\n", ret);
-        return ret;
-    }
-
-    // button setup
-    ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
-
-    if (ret < 0) {
-        printk("Failed to configure button button: %d\n", ret);
-        return ret;
-    }
-
-    gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
-    ret = gpio_add_callback(button.port, &button_cb);
-    if (ret < 0) {
-        printk("Failed to add callback: %d\n", ret);
-        return ret;
-    }
-
-    ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-    if (ret < 0) {
-        printk("Failed to configure interrupt: %d\n", ret);
-        return ret;
-    }
-
-    //button2 setup
-    ret = gpio_pin_configure_dt(&button2, GPIO_INPUT);
-
-    if (ret < 0) {
-        printk("Failed to configure button2: %d\n", ret);
-        return ret;
-    }
-
-    gpio_init_callback(&button2_cb, sw2_pressed, BIT(button2.pin));
-    ret = gpio_add_callback(button2.port, &button2_cb);
-    if (ret < 0) {
-        printk("Failed to add callback: %d\n", ret);
-        return ret;
-    }
-
-    ret = gpio_pin_interrupt_configure_dt(&button2, GPIO_INT_EDGE_TO_ACTIVE);
-    if (ret < 0) {
-        printk("Failed to configure interrupt: %d\n", ret);
-        return ret;
-    }
-
-    //button3 setup
-    ret = gpio_pin_configure_dt(&button3, GPIO_INPUT);     
-    if (ret < 0) {
-        printk("Failed to configure button3: %d\n", ret);
-        return ret;
-    }
-    gpio_init_callback(&button3_cb, sw3_pressed, BIT(button3.pin));
-    ret = gpio_add_callback(button3.port, &button3_cb);  
-    if (ret < 0) {
-        printk("Failed to add callback: %d\n", ret);
-        return ret;
-    }
-    ret = gpio_pin_interrupt_configure_dt(&button3, GPIO_INT_EDGE_TO_ACTIVE);
-    if (ret < 0) {  
-        printk("Failed to configure interrupt: %d\n", ret);
-        return ret;
-    }
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
+    ARG_UNUSED(pins);
+    k_work_submit(&button_work);
 }
 
 int main(void)
 {
-    if (initialize_pins() < 0) {
-        printk("Failed to initialize pins\n");
-        // Don't return! Go to sleep or loop forever.
-        while (1) {
-            k_sleep(K_FOREVER);
-        }
-    }
+    printk("Starting application...\n");
 
-    k_work_init_delayable(&led1_off_work, led1_off_work_handler);
+    if (!device_is_ready(uart0)) {
+        printk("UART not ready!\n");
+        return -1;
+    }
+    printk("UART device found: %s\n", uart0->name);
+
     uart_callback_set(uart0, uart_evt_cb, NULL);
     uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), 50);
 
-    k_work_init(&rock_pulse_work, rock_pulse_handler);
-    k_work_init(&button2_work, sw2_work_handler);
-    k_work_init(&button3_work, sw3_work_handler);
+    if (!device_is_ready(button.port)) {
+        printk("Button device not ready\n");
+    } else {
+        gpio_pin_configure_dt(&button, GPIO_INPUT);
+        gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+        static struct gpio_callback button_cb_data;
+        gpio_init_callback(&button_cb_data, button_cb, BIT(button.pin));
+        gpio_add_callback(button.port, &button_cb_data);
+        k_work_init(&button_work, button_pressed);
+        printk("Press button (SW0) to run Communication Test\n");
+    }
 
-    gpio_pin_set_dt(&led1, 1); 
-    gpio_pin_set_dt(&rock_pin, 1);
-    turned_on = 1;
-
+    printk("Ready. Monitoring UART...\n");
     while (1) {
-        k_sleep(K_FOREVER);  // or do other background tasks
+        k_msleep(1000);
     }
 }
 
-
 /*
-dts (just in case):
-under button child: 
-	gpio_trigger {
-		compatible = "gpio-leds";
-		trigger_pin: trigger_0 {
-			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
-			label = "Wakeup Trigger Pin"; //sbc wakeup
-		};
-		trigger_pin2: trigger_1 {
-			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
-			label = "Wakeup Trigger Pin 2"; //modem wakeup
-		};
-
-	};
-
-	gpio_wake {
-		compatible = "gpio-keys";
-		wakeup-source;
-		wake_pin: wake_pin {
-			gpios = <&gpio0 28 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Wakeup Pin"; //sbc interrupting sbc for wake
-			zephyr,code = <INPUT_KEY_4>;
-		};
-	};
-
-	aliases {
-		led0 = &led0;
-		led1 = &led1;
-		led2 = &led2;
-		led3 = &led3;
-		pwm-led0 = &pwm_led0;
-		sw0 = &button0;
-		sw1 = &button1;
-		sw2 = &button2;
-		sw3 = &button3;
-		bootloader-led0 = &led0;
-		mcuboot-button0 = &button0;
-		mcuboot-led0 = &led0;
-		watchdog0 = &wdt0;
-		trigger0 = &trigger_pin;
-		trigger1 = &trigger_pin2;
-		wakepin = &wake_pin;
-	};
-
-Kconfig (granted pwm is not needed):
-CONFIG_STDOUT_CONSOLE=y
-CONFIG_PRINTK=y
-CONFIG_PWM=y
-CONFIG_LOG=y
-CONFIG_LOG_PRINTK=y
-CONFIG_LOG_MODE_IMMEDIATE=y
-CONFIG_PWM_LOG_LEVEL_DBG=y
-CONFIG_PM=y
-CONFIG_PM_DEVICE=y
-CONFIG_SERIAL=y
-CONFIG_UART_CONSOLE=y
-
-
-*/
-
-/*
-    MODEM CONF:
-    
 
 CONFIG_UART_CONSOLE=n
 CONFIG_USE_SEGGER_RTT=y
 CONFIG_RTT_CONSOLE=y
 CONFIG_LOG=y
-CONFIG_LOG_MODE_IMMEDIATE=y
-
-# UART + SIM7080 offloaded sockets driver
 CONFIG_SERIAL=y
 CONFIG_UART_ASYNC_API=y
 
-#modem
-CONFIG_MODEM=y
-CONFIG_MODEM_SIM7080=y
 
-CONFIG_NETWORKING=y
-CONFIG_NET_SOCKETS=y
-CONFIG_NET_SOCKETS_CONNECT_TIMEOUT=15000
-CONFIG_MODEM_SIMCOM_SIM7080_APN="internet.telia.ee"
-#ip
-CONFIG_NET_IPV4=y
-CONFIG_NET_IPV6=n
-CONFIG_NET_TCP=y
-CONFIG_NET_UDP=n
-#BUFsizes
-CONFIG_NET_PKT_RX_COUNT=2
-CONFIG_NET_PKT_TX_COUNT=2
-CONFIG_NET_BUF_RX_COUNT=8
-CONFIG_NET_BUF_TX_COUNT=8
-CONFIG_NET_BUF_DATA_SIZE=128
+# NO NETWORKING - just UART
+# CONFIG_NETWORKING=n
+# CONFIG_MODEM=n
+# CONFIG_MODEM_SIM7080=n
 
-#misc build/comp bugfixes 
-CONFIG_HEAP_MEM_POOL_SIZE=4096
-CONFIG_MAIN_STACK_SIZE=4096
-CONFIG_NET_NATIVE=n
-CONFIG_NET_SOCKETS_OFFLOAD=y
-CONFIG_POSIX_API=y
-
-dts:
-
-	chosen {
-		zephyr,console = &uart0;
-		zephyr,shell-uart = &uart0;
-		zephyr,uart-mcumgr = &uart0;
-		zephyr,bt-mon-uart = &uart0;
-		zephyr,bt-c2h-uart = &uart0;
-		zephyr,sram = &sram0;
-		zephyr,flash = &flash0;
-		zephyr,code-partition = &slot0_partition;
-	};
-
-    	aliases {
-		led0 = &led0;
-		led1 = &led1;
-		led2 = &led2;
-		led3 = &led3;
-		pwm-led0 = &pwm_led0;
-		sw0 = &button0;
-		sw1 = &button1;
-		sw2 = &button2;
-		sw3 = &button3;
-		bootloader-led0 = &led0;
-		mcuboot-button0 = &button0;
-		mcuboot-led0 = &led0;
-		watchdog0 = &wdt0;
-		trigger0 = &trigger_pin;
-		trigger1 = &trigger_pin2;
-		wakepin = &wake_pin;
-		modem = &sim7080;
-	};
-
-    arduino_serial: &uart0 {
-	status = "okay";
-	compatible = "nordic,nrf-uarte";
-	current-speed = <115200>;
-	pinctrl-0 = <&uart0_default>;
-	pinctrl-1 = <&uart0_sleep>;
-	pinctrl-names = "default", "sleep";
-	
-	#address-cells = <1>;
-	#size-cells = <0>;
-	
-	sim7080: modem@0 {
-			compatible = "simcom,sim7080";
-			reg = <0>;
-			mdm-power-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
-			status = "okay";
-		};
-};
-    &rng {
-	status = "okay";
-};
-
-
+# Minimal memory usage:
+CONFIG_HEAP_MEM_POOL_SIZE=1024
+CONFIG_MAIN_STACK_SIZE=1024
 
 */
