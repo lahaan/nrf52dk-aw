@@ -315,7 +315,6 @@ void run_http_test(void)
         // 5. Make GET Request (Provide the webhook UUID path, method 1 = GET)
         // Replace with your actual webhook UUID path
         send_at_command("AT+SHREQ=\"/fd5cf81a-76a1-4d86-96ef-a883745fcf88\",1"); // Method 1 = GET
-        // *** CRITICAL CHANGE: Increase timeout SIGNIFICANTLY for SHREQ (GET request) ***
         wait_for_response(K_SECONDS(60)); // Increased timeout to 60 seconds for the HTTP transaction
 
         printk("After AT+SHREQ (GET): Status=%d, Size=%d, Success=%d\n", last_http_status_code, last_http_data_size, last_command_successful);
@@ -577,13 +576,6 @@ chosen {
 
 SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 
-00> *** Booting nRF Connect SDK v3.1.0-6c6e5b32496e ***
-00> *** Using Zephyr OS v4.1.99-1612683d4010 ***
-00> Starting application...
-00> UART device found: uart@40002000
-00> Press button (SW0) to run Communication Test
-00> Ready. Monitoring UART...
-00> 
 00> --- BUTTON PRESSED: Running Communication Test ---
 00> --- Starting Communication Test ---
 00> >>> AT
@@ -646,12 +638,12 @@ SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 00> <<< Response received within timeout.
 00> >>> AT+CSQ
 00> Waiting for response for up to 0 seconds...
-00> <<< +CSQ: 30,99
+00> <<< +CSQ: 22,99
 00> <<< OK
 00> <<< Response received within timeout.
 00> >>> AT+CPSI?
 00> Waiting for response for up to 0 seconds...
-00> <<< +CPSI: LTE NB-IOT,Online,248-01,0x2AFA,51716400,177,EUTRAN-BAND20,6254,0,0,-10,-63,-54,15
+00> <<< +CPSI: LTE CAT-M1,Online,248-01,0x2712,54276393,382,EUTRAN-BAND3,1344,5,5,-10,-92,-68,13
 00> <<< OK
 00> <<< Response received within timeout.
 00> >>> AT+CGDCONT=1,"IP","internet.telia.ee"
@@ -664,7 +656,7 @@ SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 00> <<< Response received within timeout.
 00> >>> AT+CNACT?
 00> Waiting for response for up to 0 seconds...
-00> <<< +CNACT: 0,1,"10.32.116.31"
+00> <<< +CNACT: 0,1,"10.33.205.235"
 00> <<< +CNACT: 1,0,"0.0.0.0"
 00> <<< +CNACT: 2,0,"0.0.0.0"
 00> <<< +CNACT: 3,0,"0.0.0.0"
@@ -688,7 +680,7 @@ SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 00> <<< OK
 00> <<< Response received within timeout.
 00> Waiting for network to stabilize...
-00> ..............................
+00> .........................
 00> >>> AT+CGATT?
 00> Waiting for response for up to 0 seconds...
 00> <<< +CGATT: 1
@@ -696,7 +688,7 @@ SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 00> <<< Response received within timeout.
 00> >>> AT+CNACT?
 00> Waiting for response for up to 0 seconds...
-00> <<< +CNACT: 0,1,"10.32.116.31"
+00> <<< +CNACT: 0,1,"10.33.205.235"
 00> <<< +CNACT: 1,0,"0.0.0.0"
 00> <<< +CNACT: 2,0,"0.0.0.0"
 00> <<< +CNACT: 3,0,"0.0.0.0"
@@ -716,7 +708,7 @@ SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 00> Waiting for response for up to 0 seconds...
 00> <<< OK
 00> <<< Response received within timeout.
-00> >>> AT+SHAHEAD="User-Agent","nRF52-SIM7080"
+00> >>> AT+SHAHEAD="User-Agent","nRF52-SIM7080-GET-Test"
 00> Waiting for response for up to 0 seconds...
 00> <<< OK
 00> <<< Response received within timeout.
@@ -728,32 +720,15 @@ SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 00> Waiting for response for up to 0 seconds...
 00> <<< OK
 00> <<< Response received within timeout.
-00> >>> AT+SHAHEAD="Accept",""
+00> >>> AT+SHAHEAD="Accept","/"
 00> Waiting for response for up to 0 seconds...
 00> <<< OK
 00> <<< Response received within timeout.
-00> >>> AT+SHAHEAD="Content-Type","application/json"
+00> >>> AT+SHREQ="/fd5cf81a-76a1-4d86-96ef-a883745fcf88",1
 00> Waiting for response for up to 0 seconds...
 00> <<< OK
 00> <<< Response received within timeout.
-00> >>> AT+SHBOD=39,5000
-00> Waiting for response for up to 0 seconds...
-00> <<< > 
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> Sent HTTP body + CTRL+Z
-00> >>> AT+SHREQ="/fd5cf81a-76a1-4d86-96ef-a883745fcf88",3
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHREAD=0,500
-00> Waiting for response for up to 0 seconds...
-00> <<< ERROR
-00> <<< Response received within timeout.
-00> >>> AT+SHDISC
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> --- HTTP test complete ---
+00> <<< +SHREQ: "GET",200,156
+00> <<< Parsed HTTP status: 200, data size: 156
 
 */
