@@ -1,6 +1,6 @@
 
 /*
-HTTP(s) POST TEST SW RAW AT-COMMANDS SIM7080-NRF52/52832wUART
+HTTP(s) GET TEST SW RAW AT-COMMANDS SIM7080-NRF52/52832wUART
     ZEPHYR 4.1.199 / NCS v3.1.0
 
     :Zephyr SIMCOM-SIM7080 NETWORKING STACK IS TOO FUCKING BIG FOR 52832 (RAM)
@@ -28,7 +28,8 @@ static size_t resp_len = 0;
 static bool response_complete = false;
 static bool waiting_for_response = false;
 static bool last_command_successful = false;
-static int last_http_data_size = 0;
+static int last_http_data_size = 0; // Store the size returned by +SHREQ
+static int last_http_status_code = 0; // Store the status code returned by +SHREQ
 
 // Button work
 static struct k_work button_work;
@@ -60,35 +61,48 @@ static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *
 
                     // Check for response indicators
                     if (strcmp(response_buf, "OK") == 0) {
+                        // For commands like SHBOD, OK just means the command was accepted,
+                        // the final success is determined by +SHREQ.
+                        // For other commands, OK usually means success.
                         response_complete = true;
                         waiting_for_response = false;
-                        last_command_successful = true;
+                        // last_command_successful = true; // Don't set yet for commands expecting +SHREQ
                     } else if (strcmp(response_buf, "ERROR") == 0 ||
                                strcmp(response_buf, "NO CARRIER") == 0 ||
                                strcmp(response_buf, "NO DIALTONE") == 0 ||
                                strcmp(response_buf, "NO ANSWER") == 0 ||
                                strcmp(response_buf, "NO") == 0 ||
-                               strstr(response_buf, "+CME ERROR:") != NULL ||
-                               strstr(response_buf, "+SHREQ:") != NULL && strstr(response_buf, "ERROR") != NULL) {
+                               strstr(response_buf, "+CME ERROR:") != NULL) {
                         response_complete = true;
                         waiting_for_response = false;
                         last_command_successful = false;
-                    } 
-                    // Parse HTTP response data size from SHREQ response
+                    }
+                    // Parse HTTP response from SHREQ response (This is the definitive result)
                     else if (strstr(response_buf, "+SHREQ:") != NULL) {
-                        // Example: +SHREQ:"POST",200,457
-                        char *comma1 = strchr(response_buf, ','); // First comma after method
+                        // Example: +SHREQ:"GET",200,387
+                        // Find the status code (second number)
+                        char *comma1 = strchr(response_buf, ','); // After method
                         if (comma1) {
-                            char *comma2 = strchr(comma1 + 1, ','); // Second comma before data size
+                            char *comma2 = strchr(comma1 + 1, ','); // Before data size
                             if (comma2) {
-                                // Extract the data size number after the second comma
-                                char *data_size_str = comma2 + 1;
-                                last_http_data_size = atoi(data_size_str);
-                                printk("<<< Parsed HTTP response data size: %d\n", last_http_data_size);
+                                // Extract status code (between first and second comma)
+                                char *status_str = comma1 + 1;
+                                // Temporarily null-terminate to extract status code
+                                char temp_char = *comma2;
+                                *comma2 = '\0';
+                                last_http_status_code = atoi(status_str);
+                                *comma2 = temp_char; // Restore original string
+
+                                // Extract data size (after second comma)
+                                last_http_data_size = atoi(comma2 + 1);
+                                printk("<<< Parsed HTTP status: %d, data size: %d\n", last_http_status_code, last_http_data_size);
                             }
                         }
+                        // This +SHREQ line is the definitive success/failure indicator for the HTTP transaction
+                        response_complete = true;
+                        waiting_for_response = false; // Stop waiting for this specific SHREQ command's response
+                        last_command_successful = (last_http_status_code >= 200 && last_http_status_code < 300); // Consider 2xx as success
                     }
-
                     resp_len = 0;
                 }
             } else {
@@ -126,7 +140,8 @@ void send_at_command(const char *cmd) {
 void wait_for_response(k_timeout_t timeout) {
     response_complete = false;
     waiting_for_response = true;
-    last_http_data_size = 0; // Reset HTTP data size when waiting for new response
+    last_http_data_size = 0; // Reset when waiting for a new response
+    last_http_status_code = 0;
 
     printk("Waiting for response for up to %d seconds...\n", timeout.ticks);
 
@@ -194,56 +209,58 @@ void run_http_test(void)
 {
     printk("--- Starting HTTP Test ---\n");
 
+    // --- Network Setup ---
     send_at_command("AT");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("ATE0");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CPIN?");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CGREG=1");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CGREG?");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CGATT?");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CSQ");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CPSI?");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
-    send_at_command("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"");
+    send_at_command("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\""); // Use your APN
     wait_for_response(K_SECONDS(3));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CNACT=0,1");
-    wait_for_response(K_SECONDS(10));
-    k_sleep(K_SECONDS(2));
+    wait_for_response(K_SECONDS(10)); // Note: This command failed in the log, but CNACT? showed active. Try anyway.
+    //k_sleep(K_SECONDS(2));
 
     send_at_command("AT+CNACT?");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
     send_at_command("AT+CGREG?");
     wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
+    //k_sleep(K_SECONDS(1));
 
-    // Use webhook.site URL instead of httpbin.org
-    send_at_command("AT+SHCONF=\"URL\",\"http://webhook.site\"");
+    // --- HTTP Configuration (Following Official GET Example) ---
+    // 1. Set Base URL (webhook.site)
+    send_at_command("AT+SHCONF=\"URL\",\"http://webhook.site\""); // Use http
     wait_for_response(K_SECONDS(2));
 
     send_at_command("AT+SHCONF=\"BODYLEN\",1024");
@@ -253,9 +270,10 @@ void run_http_test(void)
     wait_for_response(K_SECONDS(2));
 
     printk("Waiting for network to stabilize...\n");
-    for (int j = 0; j < 30; j++){
+    for (int j = 0; j < 25; j++){ // Reduced wait time
+        double x = (j<15) ? 0.8 : 1.1;
         printk(".");
-        k_sleep(K_SECONDS(1));
+        k_sleep(K_SECONDS(0.1*x));
     }
     printk("\n");
 
@@ -264,21 +282,23 @@ void run_http_test(void)
     send_at_command("AT+CNACT?");
     wait_for_response(K_SECONDS(2));
 
+    // 2. Connect HTTP Session
     send_at_command("AT+SHCONN");
-    wait_for_response(K_SECONDS(20));
-    k_sleep(K_SECONDS(2));
+    wait_for_response(K_SECONDS(20)); // Increased timeout for connection
+    k_sleep(K_SECONDS(1)); // Brief pause after connection
 
     send_at_command("AT+SHSTATE?");
     wait_for_response(K_SECONDS(2));
 
-    if (last_command_successful) {
+    
         printk("AT+SHCONN successful, proceeding with HTTP request.\n");
-        
+
+        // 3. Clear Headers (Recommended)
         send_at_command("AT+SHCHEAD");
         wait_for_response(K_SECONDS(2));
 
-        // Use webhook.site specific headers
-        send_at_command("AT+SHAHEAD=\"User-Agent\",\"nRF52-SIM7080\"");
+        // 4. Add Headers (Standard GET headers)
+        send_at_command("AT+SHAHEAD=\"User-Agent\",\"nRF52-SIM7080-GET-Test\"");
         wait_for_response(K_SECONDS(2));
 
         send_at_command("AT+SHAHEAD=\"Cache-control\",\"no-cache\"");
@@ -290,44 +310,44 @@ void run_http_test(void)
         send_at_command("AT+SHAHEAD=\"Accept\",\"*/*\"");
         wait_for_response(K_SECONDS(2));
 
-        send_at_command("AT+SHAHEAD=\"Content-Type\",\"application/json\"");
-        wait_for_response(K_SECONDS(2));
+        // Note: No Content-Type header needed for GET requests without a body
 
-        const char *post_data = "{\"msg\":\"Hello from nRF52 via SIM7080!\"}";
-        char shbod_cmd[50];
-        snprintf(shbod_cmd, sizeof(shbod_cmd), "AT+SHBOD=%d,5000", strlen(post_data));
-        send_at_command(shbod_cmd);
-        wait_for_response(K_SECONDS(3));
+        // 5. Make GET Request (Provide the webhook UUID path, method 1 = GET)
+        // Replace with your actual webhook UUID path
+        send_at_command("AT+SHREQ=\"/fd5cf81a-76a1-4d86-96ef-a883745fcf88\",1"); // Method 1 = GET
+        // *** CRITICAL CHANGE: Increase timeout SIGNIFICANTLY for SHREQ (GET request) ***
+        wait_for_response(K_SECONDS(60)); // Increased timeout to 60 seconds for the HTTP transaction
 
-        if (last_command_successful) {
-            for (int i = 0; post_data[i] != '\0'; i++) {
-                uart_poll_out(uart0, post_data[i]);
-            }
-            uart_poll_out(uart0, 0x1A); // CTRL+Z
-            printk(">>> Sent HTTP body + CTRL+Z\n");
+        printk("After AT+SHREQ (GET): Status=%d, Size=%d, Success=%d\n", last_http_status_code, last_http_data_size, last_command_successful);
 
-            // Use your specific webhook URL
-            send_at_command("AT+SHREQ=\"/fd5cf81a-76a1-4d86-96ef-a883745fcf88\",3");
-            wait_for_response(K_SECONDS(20)); // This will parse the data size
-            
-            // Read the response using the actual data size returned by SHREQ
-            if (last_command_successful && last_http_data_size > 0) {
+        // 6. Check SHREQ result and read response if available
+        if (last_command_successful && last_http_status_code == 200) { // Check for HTTP 200 OK
+            printk("HTTP GET successful (Status: %d). Data size reported: %d\n", last_http_status_code, last_http_data_size);
+            if (last_http_data_size > 0) {
                 char shread_cmd[30];
                 snprintf(shread_cmd, sizeof(shread_cmd), "AT+SHREAD=0,%d", last_http_data_size);
                 send_at_command(shread_cmd);
-                wait_for_response(K_SECONDS(5));
-            } else if (last_command_successful) {
-                // Fallback if no size was parsed
-                send_at_command("AT+SHREAD=0,500");
-                wait_for_response(K_SECONDS(5));
+                wait_for_response(K_SECONDS(10)); // Increased read timeout
+            } else {
+                printk("No response body data reported by +SHREQ.\n");
             }
+        } else if (last_command_successful) {
+             printk("HTTP GET successful but status code was not 200 (Status: %d). Data size reported: %d\n", last_http_status_code, last_http_data_size);
+             // Still try to read potential response body if size was reported
+             if (last_http_data_size > 0) {
+                char shread_cmd[30];
+                snprintf(shread_cmd, sizeof(shread_cmd), "AT+SHREAD=0,%d", last_http_data_size);
+                send_at_command(shread_cmd);
+                wait_for_response(K_SECONDS(10)); // Increased read timeout
+            }
+        } else {
+            printk("HTTP GET failed definitively (Status: %d, Success: %d)\n", last_http_status_code, last_command_successful);
+             printk("No data size available or request failed definitively, skipping AT+SHREAD.\n");
         }
 
-        send_at_command("AT+SHDISC");
-        wait_for_response(K_SECONDS(5));
-    } else {
+    /* else {
         printk("AT+SHCONN failed (last_command_successful=%d), skipping subsequent HTTP commands.\n", last_command_successful);
-        
+        // Debug network status
         printk("Checking network status again...\n");
         send_at_command("AT+CGREG?");
         wait_for_response(K_SECONDS(2));
@@ -337,7 +357,11 @@ void run_http_test(void)
         wait_for_response(K_SECONDS(2));
         send_at_command("AT+SHSTATE?");
         wait_for_response(K_SECONDS(2));
-    }
+    }*/
+
+    // 7. Disconnect HTTP Session
+    send_at_command("AT+SHDISC");
+    wait_for_response(K_SECONDS(5));
 
     printk("--- HTTP test complete ---\n");
 }
@@ -551,7 +575,7 @@ chosen {
 
 /*
 
-SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself wtf
+SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
 
 00> *** Booting nRF Connect SDK v3.1.0-6c6e5b32496e ***
 00> *** Using Zephyr OS v4.1.99-1612683d4010 ***
