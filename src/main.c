@@ -1,13 +1,3 @@
-
-/*
-HTTP(s) GET TEST SW RAW AT-COMMANDS SIM7080-NRF52/52832wUART
-    ZEPHYR 4.1.199 / NCS v3.1.0
-
-    :Zephyr SIMCOM-SIM7080 NETWORKING STACK IS TOO FUCKING BIG FOR 52832 (RAM)
-        >RAW AT reduces it by 6X!
-    :next GET&POST (huge)
-*/
-
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
@@ -16,31 +6,67 @@ HTTP(s) GET TEST SW RAW AT-COMMANDS SIM7080-NRF52/52832wUART
 #include <string.h>
 #include <stdlib.h>
 
-// UART & Button
+// UART & GPIO
 const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0));
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
+// Control pins
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0});
+
+static struct gpio_callback button_cb_data;
+static bool start_networking = false;
+
+// Server configuration - USING HTTPS
+#define SERVER_URL "seven080-mcu-backend.onrender.com"
+#define SERVER_HOST "seven080-mcu-backend.onrender.com" // For Host header
+#define DEVICE_ID "device001"
+#define POLL_INTERVAL_SEC 10
+
+// Certificate configuration - you'll need to get the actual certificate
+#define CA_CERT_FILE "server_ca.cer"
+#define CA_CERT_SIZE 2048 // Adjust based on actual certificate size
+
+// UART buffers - Increased sizes for HTTPS
 #define RX_BUF_SIZE 128
-static int32_t RX_TIMEOUT_DELAY = 200;
+#define RESPONSE_BUF_SIZE 1024  // Increased for HTTPS responses
+static int32_t RX_TIMEOUT_DELAY = 500;
 static uint8_t rx_buf[RX_BUF_SIZE];
-static char response_buf[RX_BUF_SIZE];
+static char response_buf[RESPONSE_BUF_SIZE];
 static size_t resp_len = 0;
 static bool response_complete = false;
 static bool waiting_for_response = false;
-static bool last_command_successful = false;
-static int last_http_data_size = 0; // Store the size returned by +SHREQ
-static int last_http_status_code = 0; // Store the status code returned by +SHREQ
+static int last_http_status_code = 0;
+static int last_http_data_size = 0;
 
-// Button work
-static struct k_work button_work;
-static void button_pressed(struct k_work *work);
+// Command buffer
+static char command_data[256];
+static bool command_received = false;
 
-// Forward decls
+// Network state
+static bool network_connected = false;
+static bool http_session_active = false;
+
+// Forward declarations
 void send_at_command(const char *cmd);
-void run_http_test(void);
-void run_communication_test(void);
+bool wait_for_response_with_timeout(const char *expected, k_timeout_t timeout);
+bool wait_for_ok_error(k_timeout_t timeout);
+bool setup_network(void);
+bool download_and_convert_certificate(void);
+bool setup_https_session(void);
+void cleanup_http_session(void);
+void poll_for_commands(void);
+void process_command(const char *response);
+void execute_command(const char *cmd, int pin, const char *data);
 
-// UART callback - Fixed version
+void button_pressed_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    printk("Button pressed! Starting communication test...\n");
+    start_networking = true;
+}
+
+// Improved UART callback
 static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *user_data)
 {
     ARG_UNUSED(dev);
@@ -54,62 +80,68 @@ static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *
         for (size_t i = 0; i < l; i++) {
             char c = p[i];
 
-            if (c == '\r' || c == '\n') {
+            if (c == '\n') {
                 if (resp_len > 0) {
                     response_buf[resp_len] = '\0';
+                    
+                    // Trim trailing CR if present
+                    if (resp_len > 0 && response_buf[resp_len-1] == '\r') {
+                        response_buf[resp_len-1] = '\0';
+                    }
+                    
                     printk("<<< %s\n", response_buf);
 
-                    // Check for response indicators
+                    // Check for standard responses
                     if (strcmp(response_buf, "OK") == 0) {
-                        // For commands like SHBOD, OK just means the command was accepted,
-                        // the final success is determined by +SHREQ.
-                        // For other commands, OK usually means success.
                         response_complete = true;
                         waiting_for_response = false;
-                        // last_command_successful = true; // Don't set yet for commands expecting +SHREQ
                     } else if (strcmp(response_buf, "ERROR") == 0 ||
-                               strcmp(response_buf, "NO CARRIER") == 0 ||
-                               strcmp(response_buf, "NO DIALTONE") == 0 ||
-                               strcmp(response_buf, "NO ANSWER") == 0 ||
-                               strcmp(response_buf, "NO") == 0 ||
                                strstr(response_buf, "+CME ERROR:") != NULL) {
                         response_complete = true;
                         waiting_for_response = false;
-                        last_command_successful = false;
                     }
-                    // Parse HTTP response from SHREQ response (This is the definitive result)
+                    // Parse HTTP response
                     else if (strstr(response_buf, "+SHREQ:") != NULL) {
-                        // Example: +SHREQ:"GET",200,387
-                        // Find the status code (second number)
-                        char *comma1 = strchr(response_buf, ','); // After method
+                        char *comma1 = strchr(response_buf, ',');
                         if (comma1) {
-                            char *comma2 = strchr(comma1 + 1, ','); // Before data size
+                            char *comma2 = strchr(comma1 + 1, ',');
                             if (comma2) {
-                                // Extract status code (between first and second comma)
-                                char *status_str = comma1 + 1;
-                                // Temporarily null-terminate to extract status code
-                                char temp_char = *comma2;
-                                *comma2 = '\0';
-                                last_http_status_code = atoi(status_str);
-                                *comma2 = temp_char; // Restore original string
-
-                                // Extract data size (after second comma)
+                                last_http_status_code = atoi(comma1 + 1);
                                 last_http_data_size = atoi(comma2 + 1);
-                                printk("<<< Parsed HTTP status: %d, data size: %d\n", last_http_status_code, last_http_data_size);
+                                printk("HTTPS Status: %d, Size: %d\n", 
+                                       last_http_status_code, last_http_data_size);
                             }
                         }
-                        // This +SHREQ line is the definitive success/failure indicator for the HTTP transaction
                         response_complete = true;
-                        waiting_for_response = false; // Stop waiting for this specific SHREQ command's response
-                        last_command_successful = (last_http_status_code >= 200 && last_http_status_code < 300); // Consider 2xx as success
+                    }
+                    // Parse HTTP state
+                    else if (strstr(response_buf, "+SHSTATE:") != NULL) {
+                        http_session_active = (strstr(response_buf, "+SHSTATE: 1") != NULL);
+                        printk("HTTPS Session State: %s\n", http_session_active ? "Connected" : "Disconnected");
+                        response_complete = true;
+                    }
+                    // Capture HTTP data (starts with +SHREAD:)
+                    else if (strstr(response_buf, "+SHREAD:") != NULL) {
+                        // The next line will contain the actual data
+                    }
+                    // Capture actual data after +SHREAD
+                    else if (waiting_for_response && last_http_data_size > 0 && 
+                             resp_len > 10 && response_buf[0] == '{') {
+                        // This looks like JSON data - store it
+                        if (resp_len < sizeof(command_data) - 1) {
+                            strncpy(command_data, response_buf, sizeof(command_data) - 1);
+                            command_data[sizeof(command_data) - 1] = '\0';
+                            command_received = true;
+                            printk("Command data captured: %s\n", command_data);
+                        }
                     }
                     resp_len = 0;
                 }
-            } else {
+            } else if (c != '\r') {  // Ignore carriage returns
                 if (resp_len < sizeof(response_buf) - 1) {
                     response_buf[resp_len++] = c;
                 } else {
-                    printk("<<< Buffer overflow, resetting buffer. Received char: '%c'\n", c);
+                    // Buffer overflow, reset
                     resp_len = 0;
                 }
             }
@@ -117,9 +149,6 @@ static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *
         break;
     }
     case UART_RX_DISABLED:
-        uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), RX_TIMEOUT_DELAY);
-        break;
-
     case UART_RX_STOPPED:
         uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), RX_TIMEOUT_DELAY);
         break;
@@ -134,601 +163,534 @@ void send_at_command(const char *cmd) {
         uart_poll_out(uart0, cmd[i]);
     }
     uart_poll_out(uart0, '\r');
-    uart_poll_out(uart0, '\n');
 }
 
-void wait_for_response(k_timeout_t timeout) {
+bool wait_for_ok_error(k_timeout_t timeout) {
     response_complete = false;
     waiting_for_response = true;
-    last_http_data_size = 0; // Reset when waiting for a new response
-    last_http_status_code = 0;
-
-    printk("Waiting for response for up to %d seconds...\n", timeout.ticks);
 
     int64_t start = k_uptime_get();
-    while (waiting_for_response && (k_uptime_get() - start) < timeout.ticks * 1000) {
-        k_msleep(10);
+    while (!response_complete && (k_uptime_get() - start) < timeout.ticks) {
+        k_msleep(50);
     }
 
-    if (waiting_for_response) {
-        printk("<<< (timeout waiting for response)\n");
+    if (!response_complete) {
+        printk("Response timeout\n");
         waiting_for_response = false;
-        last_command_successful = false;
-    } else {
-        printk("<<< Response received within timeout.\n");
+        return false;
     }
 
-    if (resp_len > 0) {
-        response_buf[resp_len] = '\0';
-        printk("<<< Leftover buffer after wait: '%s'\n", response_buf);
-        resp_len = 0;
-    }
+    waiting_for_response = false;
+    return true;
 }
 
-static void button_pressed(struct k_work *work)
-{
-    ARG_UNUSED(work);
-    printk("\n--- BUTTON PRESSED: Running Communication Test ---\n");
-    run_communication_test();
-}
+bool wait_for_response_with_timeout(const char *expected, k_timeout_t timeout) {
+    resp_len = 0;
+    response_complete = false;
+    waiting_for_response = true;
 
-void run_communication_test(void)
-{
-    printk("--- Starting Communication Test ---\n");
-
-    send_at_command("AT");
-    wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
-
-    send_at_command("ATI");
-    wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CGMR");
-    wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CGMI");
-    wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
-
-    send_at_command("ATE1");
-    wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
-
-    send_at_command("ATE0");
-    wait_for_response(K_SECONDS(2));
-    k_sleep(K_SECONDS(1));
-
-    printk("--- Communication Test Complete ---\n");
-    printk("--- Now Running HTTP Test ---\n");
-    run_http_test();
-}
-
-void run_http_test(void)
-{
-    printk("--- Starting HTTP Test ---\n");
-
-    // --- Network Setup ---
-    send_at_command("AT");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("ATE0");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CPIN?");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CGREG=1");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CGREG?");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CGATT?");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CSQ");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CPSI?");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\""); // Use your APN
-    wait_for_response(K_SECONDS(3));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CNACT=0,1");
-    wait_for_response(K_SECONDS(10)); // Note: This command failed in the log, but CNACT? showed active. Try anyway.
-    //k_sleep(K_SECONDS(2));
-
-    send_at_command("AT+CNACT?");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    send_at_command("AT+CGREG?");
-    wait_for_response(K_SECONDS(2));
-    //k_sleep(K_SECONDS(1));
-
-    // --- HTTP Configuration (Following Official GET Example) ---
-    // 1. Set Base URL (webhook.site)
-    send_at_command("AT+SHCONF=\"URL\",\"http://webhook.site\""); // Use http
-    wait_for_response(K_SECONDS(2));
-
-    send_at_command("AT+SHCONF=\"BODYLEN\",1024");
-    wait_for_response(K_SECONDS(2));
-
-    send_at_command("AT+SHCONF=\"HEADERLEN\",350");
-    wait_for_response(K_SECONDS(2));
-
-    printk("Waiting for network to stabilize...\n");
-    for (int j = 0; j < 25; j++){ // Reduced wait time
-        double x = (j<15) ? 0.8 : 1.1;
-        printk(".");
-        k_sleep(K_SECONDS(0.1*x));
-    }
-    printk("\n");
-
-    send_at_command("AT+CGATT?");
-    wait_for_response(K_SECONDS(2));
-    send_at_command("AT+CNACT?");
-    wait_for_response(K_SECONDS(2));
-
-    // 2. Connect HTTP Session
-    send_at_command("AT+SHCONN");
-    wait_for_response(K_SECONDS(20)); // Increased timeout for connection
-    k_sleep(K_SECONDS(1)); // Brief pause after connection
-
-    send_at_command("AT+SHSTATE?");
-    wait_for_response(K_SECONDS(2));
-
-    
-        printk("AT+SHCONN successful, proceeding with HTTP request.\n");
-
-        // 3. Clear Headers (Recommended)
-        send_at_command("AT+SHCHEAD");
-        wait_for_response(K_SECONDS(2));
-
-        // 4. Add Headers (Standard GET headers)
-        send_at_command("AT+SHAHEAD=\"User-Agent\",\"nRF52-SIM7080-GET-Test\"");
-        wait_for_response(K_SECONDS(2));
-
-        send_at_command("AT+SHAHEAD=\"Cache-control\",\"no-cache\"");
-        wait_for_response(K_SECONDS(2));
-
-        send_at_command("AT+SHAHEAD=\"Connection\",\"keep-alive\"");
-        wait_for_response(K_SECONDS(2));
-
-        send_at_command("AT+SHAHEAD=\"Accept\",\"*/*\"");
-        wait_for_response(K_SECONDS(2));
-
-        // Note: No Content-Type header needed for GET requests without a body
-
-        // 5. Make GET Request (Provide the webhook UUID path, method 1 = GET)
-        // Replace with your actual webhook UUID path
-        send_at_command("AT+SHREQ=\"/fd5cf81a-76a1-4d86-96ef-a883745fcf88\",1"); // Method 1 = GET
-        wait_for_response(K_SECONDS(60)); // Increased timeout to 60 seconds for the HTTP transaction
-
-        printk("After AT+SHREQ (GET): Status=%d, Size=%d, Success=%d\n", last_http_status_code, last_http_data_size, last_command_successful);
-
-        // 6. Check SHREQ result and read response if available
-        if (last_command_successful && last_http_status_code == 200) { // Check for HTTP 200 OK
-            printk("HTTP GET successful (Status: %d). Data size reported: %d\n", last_http_status_code, last_http_data_size);
-            if (last_http_data_size > 0) {
-                char shread_cmd[30];
-                snprintf(shread_cmd, sizeof(shread_cmd), "AT+SHREAD=0,%d", last_http_data_size);
-                send_at_command(shread_cmd);
-                wait_for_response(K_SECONDS(10)); // Increased read timeout
-            } else {
-                printk("No response body data reported by +SHREQ.\n");
-            }
-        } else if (last_command_successful) {
-             printk("HTTP GET successful but status code was not 200 (Status: %d). Data size reported: %d\n", last_http_status_code, last_http_data_size);
-             // Still try to read potential response body if size was reported
-             if (last_http_data_size > 0) {
-                char shread_cmd[30];
-                snprintf(shread_cmd, sizeof(shread_cmd), "AT+SHREAD=0,%d", last_http_data_size);
-                send_at_command(shread_cmd);
-                wait_for_response(K_SECONDS(10)); // Increased read timeout
-            }
-        } else {
-            printk("HTTP GET failed definitively (Status: %d, Success: %d)\n", last_http_status_code, last_command_successful);
-             printk("No data size available or request failed definitively, skipping AT+SHREAD.\n");
+    int64_t start = k_uptime_get();
+    while (!response_complete && (k_uptime_get() - start) < timeout.ticks) {
+        if (resp_len > 0 && strstr(response_buf, expected) != NULL) {
+            response_complete = true;
+            break;
         }
+        k_msleep(50);
+    }
 
-    /* else {
-        printk("AT+SHCONN failed (last_command_successful=%d), skipping subsequent HTTP commands.\n", last_command_successful);
-        // Debug network status
-        printk("Checking network status again...\n");
+    waiting_for_response = false;
+    return response_complete;
+}
+
+bool setup_network(void) {
+    printk("Setting up network...\n");
+    
+    // Enable verbose errors
+    send_at_command("AT+CMEE=1");
+    if (!wait_for_ok_error(K_SECONDS(2))) return false;
+    
+    // Basic modem init
+    send_at_command("AT");
+    if (!wait_for_ok_error(K_SECONDS(2))) return false;
+    
+    send_at_command("ATE0");
+    if (!wait_for_ok_error(K_SECONDS(2))) return false;
+    
+    // Check SIM
+    send_at_command("AT+CPIN?");
+    if (!wait_for_response_with_timeout("READY", K_SECONDS(2))) return false;
+    
+    // Network registration
+    send_at_command("AT+CGREG=1");
+    if (!wait_for_ok_error(K_SECONDS(2))) return false;
+    
+    // Wait for registration
+    bool registered = false;
+    for (int i = 0; i < 15; i++) {
         send_at_command("AT+CGREG?");
-        wait_for_response(K_SECONDS(2));
-        send_at_command("AT+CGATT?");
-        wait_for_response(K_SECONDS(2));
+        if (wait_for_response_with_timeout("+CGREG: 1,1", K_SECONDS(2)) ||
+            wait_for_response_with_timeout("+CGREG: 1,5", K_SECONDS(2))) {
+            printk("Network registered!\n");
+            registered = true;
+            break;
+        }
+        k_sleep(K_SECONDS(2));
+    }
+    
+    if (!registered) {
+        printk("Network registration failed\n");
+        return false;
+    }
+    
+    // Set APN
+    send_at_command("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"");
+    if (!wait_for_ok_error(K_SECONDS(3))) return false;
+    
+    // Activate PDP context
+    send_at_command("AT+CNACT=0,1");
+    if (!wait_for_ok_error(K_SECONDS(15))) {
+        // Check if already active
         send_at_command("AT+CNACT?");
-        wait_for_response(K_SECONDS(2));
-        send_at_command("AT+SHSTATE?");
-        wait_for_response(K_SECONDS(2));
-    }*/
-
-    // 7. Disconnect HTTP Session
-    send_at_command("AT+SHDISC");
-    wait_for_response(K_SECONDS(5));
-
-    printk("--- HTTP test complete ---\n");
+        if (!wait_for_response_with_timeout("+CNACT: 0,1", K_SECONDS(2))) {
+            return false;
+        }
+    }
+    
+    // Check if active
+    send_at_command("AT+CNACT?");
+    if (!wait_for_response_with_timeout("+CNACT: 0,1", K_SECONDS(2))) {
+        return false;
+    }
+    
+    network_connected = true;
+    printk("Network setup complete\n");
+    return true;
 }
 
-static void button_cb(const struct device *dev, struct gpio_callback *cb,
-                      uint32_t pins)
-{
-    ARG_UNUSED(dev);
-    ARG_UNUSED(cb);
-    ARG_UNUSED(pins);
-    k_work_submit(&button_work);
+bool download_and_convert_certificate(void) {
+    printk("Setting up certificate for HTTPS...\n");
+    
+    // Note: This is a simplified version. You need to:
+    // 1. Actually download the CA certificate for your server
+    // 2. Convert it to the module's format
+    // 3. Store it in the module's file system
+    
+    // For now, we'll skip certificate verification as a temporary solution
+    // This is INSECURE but may work for testing
+    
+    printk("WARNING: Skipping certificate verification (INSECURE)\n");
+    //return true;
+    
+    // Proper certificate handling (commented out for now):
+    
+    // Initialize file system
+    send_at_command("AT+CFSINIT");
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("File system init failed\n");
+        return false;
+    }
+    
+    // Download certificate (you need the actual certificate data)
+    // This is just a template - you need to provide the actual certificate
+    send_at_command("AT+CFSWFILE=3,\"server_ca.cer\",0,1492,1000");
+    if (!wait_for_ok_error(K_SECONDS(10))) {
+        printk("Certificate download failed\n");
+        send_at_command("AT+CFSTERM");
+        return false;
+    }
+    
+    // Terminate file system
+    send_at_command("AT+CFSTERM");
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("File system terminate failed\n");
+        return false;
+    }
+    
+    // Convert certificate
+    send_at_command("AT+CSSLCFG=\"convert\",2,\"server_ca.cer\"");
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("Certificate conversion failed\n");
+        return false;
+    }
+    
+    printk("Certificate setup complete\n");
+    return true;
+    
 }
+
+bool setup_https_session(void) {
+    printk("Setting up HTTPS session...\n");
+    
+    // Clean up any existing session first
+    cleanup_http_session();
+    
+    // Setup certificate (or skip verification)
+    if (!download_and_convert_certificate()) {
+        printk("Certificate setup failed, trying without verification\n");
+    }
+    
+    // Configure SSL - Using TLS 1.2
+    send_at_command("AT+CSSLCFG=\"sslversion\",1,3");
+    if (!wait_for_ok_error(K_SECONDS(3))) {
+        printk("SSL version configuration failed\n");
+        return false;
+    }
+    
+    // Skip certificate verification for now (empty string)
+    // In production, use the actual certificate: AT+SHSSL=1,"server_ca.cer"
+    send_at_command("AT+SHSSL=1,\"\"");
+    if (!wait_for_ok_error(K_SECONDS(3))) {
+        printk("SSL configuration failed\n");
+        return false;
+    }
+    
+    // Configure HTTPS parameters with larger buffers
+    char cmd[128];
+    
+    // Set URL - USING HTTPS
+    snprintf(cmd, sizeof(cmd), "AT+SHCONF=\"URL\",\"https://%s\"", SERVER_URL);
+    send_at_command(cmd);
+    if (!wait_for_ok_error(K_SECONDS(3))) {
+        printk("URL configuration failed\n");
+        return false;
+    }
+    
+    // Use larger buffer sizes as shown in app note
+    send_at_command("AT+SHCONF=\"BODYLEN\",1024");
+    if (!wait_for_ok_error(K_SECONDS(3))) {
+        printk("BODYLEN configuration failed\n");
+        return false;
+    }
+    
+    send_at_command("AT+SHCONF=\"HEADERLEN\",350");
+    if (!wait_for_ok_error(K_SECONDS(3))) {
+        printk("HEADERLEN configuration failed\n");
+        return false;
+    }
+    
+    // Connect HTTPS session
+    send_at_command("AT+SHCONN");
+    if (!wait_for_ok_error(K_SECONDS(30))) {  // Increased timeout for HTTPS
+        printk("HTTPS connection failed\n");
+        return false;
+    }
+    
+    // Check state
+    send_at_command("AT+SHSTATE?");
+    if (!wait_for_response_with_timeout("+SHSTATE: 1", K_SECONDS(5))) {
+        printk("HTTPS session not active\n");
+        return false;
+    }
+    
+    http_session_active = true;
+    printk("HTTPS session setup complete\n");
+    return true;
+}
+
+void cleanup_http_session(void) {
+    if (http_session_active) {
+        printk("Cleaning up HTTPS session...\n");
+        send_at_command("AT+SHDISC");
+        wait_for_ok_error(K_SECONDS(5));
+        http_session_active = false;
+    }
+}
+
+void poll_for_commands(void) {
+    if (!http_session_active) {
+        if (!setup_https_session()) {
+            printk("Failed to setup HTTPS session\n");
+            return;
+        }
+    }
+    
+    printk("Polling for commands...\n");
+    
+    // Clear headers and parameters
+    send_at_command("AT+SHCHEAD");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("Clear headers failed\n");
+        cleanup_http_session();
+        return;
+    }
+    
+    send_at_command("AT+SHCPARA");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("Clear parameters failed\n");
+        cleanup_http_session();
+        return;
+    }
+    
+    // Add headers as shown in app note
+    send_at_command("AT+SHAHEAD=\"User-Agent\",\"nRF52-IoT-Controller\"");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("User-Agent header failed\n");
+        cleanup_http_session();
+        return;
+    }
+    
+    send_at_command("AT+SHAHEAD=\"Accept\",\"*/*\"");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("Accept header failed\n");
+        cleanup_http_session();
+        return;
+    }
+    
+    send_at_command("AT+SHAHEAD=\"Cache-control\",\"no-cache\"");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("Cache-control header failed\n");
+        cleanup_http_session();
+        return;
+    }
+    
+    send_at_command("AT+SHAHEAD=\"Connection\",\"keep-alive\"");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("Connection header failed\n");
+        cleanup_http_session();
+        return;
+    }
+    
+    // Make GET request to poll endpoint - USING HTTPS
+    char poll_url[128];
+    snprintf(poll_url, sizeof(poll_url), "AT+SHREQ=\"/api/poll/%s\",1", DEVICE_ID);
+    send_at_command(poll_url);
+    
+    if (!wait_for_ok_error(K_SECONDS(30))) {
+        printk("HTTPS request failed or timeout\n");
+        cleanup_http_session();
+        return;
+    }
+    
+    // Check if we got a successful response
+    if (last_http_status_code == 200 && last_http_data_size > 0) {
+        printk("Reading response data, size: %d\n", last_http_data_size);
+        
+        // Read the response data
+        char read_cmd[32];
+        int read_size = last_http_data_size;
+        if (read_size > 500) read_size = 500; // Conservative limit
+        
+        snprintf(read_cmd, sizeof(read_cmd), "AT+SHREAD=0,%d", read_size);
+        send_at_command(read_cmd);
+        
+        // Wait for data with longer timeout
+        command_received = false;
+        if (wait_for_ok_error(K_SECONDS(10)) && command_received) {
+            printk("Received command: %s\n", command_data);
+            process_command(command_data);
+            
+            // Send acknowledgment - USING HTTPS
+            char ack_url[128];
+            snprintf(ack_url, sizeof(ack_url), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
+            send_at_command(ack_url);
+            wait_for_ok_error(K_SECONDS(10));
+        } else {
+            printk("No command data received\n");
+        }
+    } else {
+        printk("No commands available (Status: %d)\n", last_http_status_code);
+    }
+}
+
+void process_command(const char *response) {
+    printk("Processing command: %s\n", response);
+    
+    // Simple JSON parsing - look for command structure
+    if (strstr(response, "NOCMD") != NULL || strstr(response, "no command") != NULL) {
+        printk("No commands waiting\n");
+        return;
+    }
+    
+    // Extract command, pin, and data from JSON
+    // Expected format: {"command":"LED_ON","pin":17,"data":"some_data"}
+    char cmd[32] = {0};
+    int pin = 0;
+    char data[64] = {0};
+    
+    // Parse command
+    const char *cmd_start = strstr(response, "\"command\":\"");
+    if (cmd_start) {
+        cmd_start += 11; // Skip "\"command\":\""
+        const char *cmd_end = strchr(cmd_start, '\"');
+        if (cmd_end) {
+            int len = cmd_end - cmd_start;
+            if (len < sizeof(cmd)) {
+                strncpy(cmd, cmd_start, len);
+                cmd[len] = '\0';
+            }
+        }
+    }
+    
+    // Parse pin
+    const char *pin_start = strstr(response, "\"pin\":");
+    if (pin_start) {
+        pin_start += 6; // Skip "\"pin\":"
+        pin = atoi(pin_start);
+    }
+    
+    // Parse data
+    const char *data_start = strstr(response, "\"data\":\"");
+    if (data_start) {
+        data_start += 8; // Skip "\"data\":\""
+        const char *data_end = strchr(data_start, '\"');
+        if (data_end) {
+            int len = data_end - data_start;
+            if (len < sizeof(data)) {
+                strncpy(data, data_start, len);
+                data[len] = '\0';
+            }
+        }
+    }
+    
+    if (strlen(cmd) > 0) {
+        printk("Parsed - CMD: %s, PIN: %d, DATA: %s\n", cmd, pin, data);
+        execute_command(cmd, pin, data);
+    } else {
+        printk("No valid command found in response\n");
+    }
+}
+
+void execute_command(const char *cmd, int pin, const char *data) {
+    printk("Executing: %s on pin %d\n", cmd, pin);
+    
+    if (strcmp(cmd, "LED_ON") == 0) {
+        if (gpio_is_ready_dt(&led0)) {
+            gpio_pin_set_dt(&led0, 1);
+            printk("LED ON\n");
+        }
+    }
+    else if (strcmp(cmd, "LED_OFF") == 0) {
+        if (gpio_is_ready_dt(&led0)) {
+            gpio_pin_set_dt(&led0, 0);
+            printk("LED OFF\n");
+        }
+    }
+    else if (strcmp(cmd, "TOGGLE") == 0) {
+        if (gpio_is_ready_dt(&led0)) {
+            gpio_pin_toggle_dt(&led0);
+            printk("LED TOGGLED\n");
+        }
+    }
+    else if (strcmp(cmd, "BOOT") == 0) {
+        if (gpio_is_ready_dt(&trigger_pin)) {
+            printk("Triggering SBC boot sequence...\n");
+            gpio_pin_set_dt(&trigger_pin, 1);
+            k_sleep(K_SECONDS(1));
+            gpio_pin_set_dt(&trigger_pin, 0);
+            printk("Boot trigger complete\n");
+        }
+    }
+    else if (strcmp(cmd, "PULSE") == 0) {
+        if (pin == 11 && gpio_is_ready_dt(&trigger_pin)) {
+            gpio_pin_set_dt(&trigger_pin, 1);
+            k_sleep(K_MSEC(500));
+            gpio_pin_set_dt(&trigger_pin, 0);
+            printk("Pulsed pin %d\n", pin);
+        }
+    }
+    else if (strcmp(cmd, "BLINK") == 0) {
+        if (gpio_is_ready_dt(&led0)) {
+            int count = 3;
+            if (data[0] != '\0') count = atoi(data);
+            if (count <= 0) count = 3;
+            
+            for (int i = 0; i < count; i++) {
+                gpio_pin_set_dt(&led0, 1);
+                k_sleep(K_MSEC(200));
+                gpio_pin_set_dt(&led0, 0);
+                k_sleep(K_MSEC(200));
+            }
+            printk("Blink sequence complete (%d times)\n", count);
+        }
+    }
+    else if (strcmp(cmd, "STATUS") == 0) {
+        printk("Status requested - would send telemetry here\n");
+    }
+    else {
+        printk("Unknown command: %s\n", cmd);
+    }
+}
+
+// Main polling thread
+void polling_thread(void) {
+    printk("Starting polling thread...\n");
+    
+    // Wait for button press to start networking
+    while (!start_networking) {
+        k_sleep(K_MSEC(100));
+    }
+    
+    printk("Button triggered networking start!\n");
+    
+    // Setup network
+    if (!setup_network()) {
+        printk("Network setup failed!\n");
+        return;
+    }
+    
+    // Main polling loop
+    while (1) {
+        poll_for_commands();
+        k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
+    }
+}
+
+K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
 
 int main(void)
 {
-    printk("Starting application...\n");
+    printk("IoT Controller Starting...\n");
 
     if (!device_is_ready(uart0)) {
         printk("UART not ready!\n");
-        return -1;
+        return 0;
     }
-    printk("UART device found: %s\n", uart0->name);
 
+    /* Register UART callback and enable RX */
     uart_callback_set(uart0, uart_evt_cb, NULL);
-    uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), 50);
+    int err = uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), RX_TIMEOUT_DELAY);
+    if (err) {
+        printk("Failed to enable UART RX: %d\n", err);
+        return 0;
+    }
 
-    if (!device_is_ready(button.port)) {
-        printk("Button device not ready\n");
-    } else {
-        gpio_pin_configure_dt(&button, GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-        static struct gpio_callback button_cb_data;
-        gpio_init_callback(&button_cb_data, button_cb, BIT(button.pin));
+    /* Configure GPIOs */
+    if (gpio_is_ready_dt(&led0)) {
+        err = gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
+        if (err) {
+            printk("Failed to configure led0: %d\n", err);
+        }
+    }
+
+    if (gpio_is_ready_dt(&led1)) {
+        err = gpio_pin_configure_dt(&led1, GPIO_OUTPUT_INACTIVE);
+        if (err) {
+            printk("Failed to configure led1: %d\n", err);
+        }
+    }
+
+    if (gpio_is_ready_dt(&trigger_pin)) {
+        err = gpio_pin_configure_dt(&trigger_pin, GPIO_OUTPUT_INACTIVE);
+        if (err) {
+            printk("Failed to configure trigger_pin: %d\n", err);
+        }
+    }
+
+    if (gpio_is_ready_dt(&button)) {
+        err = gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
+        if (err) {
+            printk("Failed to configure button: %d\n", err);
+        }
+
+        err = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+        if (err) {
+            printk("Failed to configure button interrupt: %d\n", err);
+        }
+
+        gpio_init_callback(&button_cb_data, button_pressed_cb, BIT(button.pin));
         gpio_add_callback(button.port, &button_cb_data);
-        k_work_init(&button_work, button_pressed);
-        printk("Press button (SW0) to run Communication Test\n");
+        printk("Button configured with interrupt\n");
     }
 
-    printk("Ready. Monitoring UART...\n");
-    while (1) {
-        k_msleep(1000);
-    }
+    return 0;
 }
-
-
-/*
-
-CONFIG_UART_CONSOLE=n
-CONFIG_USE_SEGGER_RTT=y
-CONFIG_RTT_CONSOLE=y
-CONFIG_LOG=y
-CONFIG_SERIAL=y
-CONFIG_UART_ASYNC_API=y
-
-
-# NO NETWORKING - just UART
-# CONFIG_NETWORKING=n
-# CONFIG_MODEM=n
-# CONFIG_MODEM_SIM7080=n
-
-# Minimal memory usage:
-CONFIG_HEAP_MEM_POOL_SIZE=1024
-CONFIG_MAIN_STACK_SIZE=1024
-
-*/
-
-/*
-def. dts -- most of dts USELESS DUE TO USING RAW AT INSTEAD 
-
-chosen {
-		zephyr,console = &uart0;
-		zephyr,shell-uart = &uart0;
-		zephyr,uart-mcumgr = &uart0;
-		zephyr,bt-mon-uart = &uart0;
-		zephyr,bt-c2h-uart = &uart0;
-		zephyr,sram = &sram0;
-		zephyr,flash = &flash0;
-		zephyr,code-partition = &slot0_partition;
-	};
-
-	leds {
-		compatible = "gpio-leds";
-
-		led0: led_0 {
-			gpios = <&gpio0 17 GPIO_ACTIVE_LOW>;
-			label = "Green LED 0";
-		};
-
-		led1: led_1 {
-			gpios = <&gpio0 18 GPIO_ACTIVE_LOW>;
-			label = "Green LED 1";
-		};
-
-		led2: led_2 {
-			gpios = <&gpio0 19 GPIO_ACTIVE_LOW>;
-			label = "Green LED 2";
-		};
-
-		led3: led_3 {
-			gpios = <&gpio0 20 GPIO_ACTIVE_LOW>;
-			label = "Green LED 3";
-		};
-	};
-
-	pwmleds {
-		compatible = "pwm-leds";
-
-		pwm_led0: pwm_led_0 {
-			pwms = <&pwm0 0 PWM_MSEC(20) PWM_POLARITY_INVERTED>;
-		};
-	};
-
-	buttons {
-		compatible = "gpio-keys";
-		wakeup-source;
-
-		button0: button_0 {
-			gpios = <&gpio0 13 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Push button switch 0";
-			zephyr,code = <INPUT_KEY_0>;
-		};
-
-		button1: button_1 {
-			gpios = <&gpio0 14 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Push button switch 1";
-			zephyr,code = <INPUT_KEY_1>;
-		};
-
-		button2: button_2 {
-			gpios = <&gpio0 15 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Push button switch 2";
-			zephyr,code = <INPUT_KEY_2>;
-		};
-
-		button3: button_3 {
-			gpios = <&gpio0 16 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Push button switch 3";
-			zephyr,code = <INPUT_KEY_3>;
-		};
-	};
-
-	gpio_trigger {
-		compatible = "gpio-leds";
-		trigger_pin: trigger_0 {
-			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
-			label = "Wakeup Trigger Pin"; //sbc wakeup
-		};
-		trigger_pin2: trigger_1 {
-			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
-			label = "Wakeup Trigger Pin 2"; //modem wakeup
-		};
-
-	};
-
-	gpio_wake {
-		compatible = "gpio-keys";
-		wakeup-source;
-		wake_pin: wake_pin {
-			gpios = <&gpio0 28 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Wakeup Pin"; //sbc interrupting sbc for wake
-			zephyr,code = <INPUT_KEY_4>;
-		};
-	};
-
-
-    aliases {
-		led0 = &led0;
-		led1 = &led1;
-		led2 = &led2;
-		led3 = &led3;
-		pwm-led0 = &pwm_led0;
-		sw0 = &button0;
-		sw1 = &button1;
-		sw2 = &button2;
-		sw3 = &button3;
-		bootloader-led0 = &led0;
-		mcuboot-button0 = &button0;
-		mcuboot-led0 = &led0;
-		watchdog0 = &wdt0;
-		trigger0 = &trigger_pin;
-		trigger1 = &trigger_pin2;
-		wakepin = &wake_pin;
-		modem = &sim7080;
-	};
-
-    arduino_serial: &uart0 {
-	status = "okay";
-	compatible = "nordic,nrf-uarte";
-	current-speed = <115200>;
-	pinctrl-0 = <&uart0_default>;
-	pinctrl-1 = <&uart0_sleep>;
-	pinctrl-names = "default", "sleep";
-	
-	#address-cells = <1>;
-	#size-cells = <0>;
-	
-	sim7080: modem@0 {
-			compatible = "simcom,sim7080";
-			reg = <0>;
-			mdm-power-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
-            status = "okay";
-            };
-    };
-
-    &rng {
-	status = "okay";
-    };
-*/
-
-
-
-/*
-
-SAMPLE OUTPUT (webhook) RTT, IDK why it it fails to show on website itself
-
-00> --- BUTTON PRESSED: Running Communication Test ---
-00> --- Starting Communication Test ---
-00> >>> AT
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> ATI
-00> Waiting for response for up to 0 seconds...
-00> <<< R1951.07
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CGMR
-00> Waiting for response for up to 0 seconds...
-00> <<< Revision:1951B16SIM7080
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CGMI
-00> Waiting for response for up to 0 seconds...
-00> <<< SIMCOM_Ltd
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> ATE1
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> ATE0
-00> Waiting for response for up to 0 seconds...
-00> <<< ATE0
-00> <<< OK
-00> <<< Response received within timeout.
-00> --- Communication Test Complete ---
-00> --- Now Running HTTP Test ---
-00> --- Starting HTTP Test ---
-00> >>> AT
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> ATE0
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CPIN?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CPIN: READY
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CGREG=1
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CGREG?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CGREG: 1,1
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CGATT?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CGATT: 1
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CSQ
-00> Waiting for response for up to 0 seconds...
-00> <<< +CSQ: 22,99
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CPSI?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CPSI: LTE CAT-M1,Online,248-01,0x2712,54276393,382,EUTRAN-BAND3,1344,5,5,-10,-92,-68,13
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CGDCONT=1,"IP","internet.telia.ee"
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CNACT=0,1
-00> Waiting for response for up to 0 seconds...
-00> <<< ERROR
-00> <<< Response received within timeout.
-00> >>> AT+CNACT?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CNACT: 0,1,"10.33.205.235"
-00> <<< +CNACT: 1,0,"0.0.0.0"
-00> <<< +CNACT: 2,0,"0.0.0.0"
-00> <<< +CNACT: 3,0,"0.0.0.0"
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CGREG?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CGREG: 1,1
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHCONF="URL","http://webhook.site"
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHCONF="BODYLEN",1024
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHCONF="HEADERLEN",350
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> Waiting for network to stabilize...
-00> .........................
-00> >>> AT+CGATT?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CGATT: 1
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+CNACT?
-00> Waiting for response for up to 0 seconds...
-00> <<< +CNACT: 0,1,"10.33.205.235"
-00> <<< +CNACT: 1,0,"0.0.0.0"
-00> <<< +CNACT: 2,0,"0.0.0.0"
-00> <<< +CNACT: 3,0,"0.0.0.0"
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHCONN
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHSTATE?
-00> Waiting for response for up to 0 seconds...
-00> <<< +SHSTATE: 1
-00> <<< OK
-00> <<< Response received within timeout.
-00> AT+SHCONN successful, proceeding with HTTP request.
-00> >>> AT+SHCHEAD
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHAHEAD="User-Agent","nRF52-SIM7080-GET-Test"
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHAHEAD="Cache-control","no-cache"
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHAHEAD="Connection","keep-alive"
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHAHEAD="Accept","/"
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> >>> AT+SHREQ="/fd5cf81a-76a1-4d86-96ef-a883745fcf88",1
-00> Waiting for response for up to 0 seconds...
-00> <<< OK
-00> <<< Response received within timeout.
-00> <<< +SHREQ: "GET",200,156
-00> <<< Parsed HTTP status: 200, data size: 156
-
-*/
