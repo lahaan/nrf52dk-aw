@@ -60,6 +60,94 @@ void poll_for_commands(void);
 void process_command(const char *response);
 void execute_command(const char *cmd, int pin, const char *data);
 
+const char ca_cert[] =
+"-----BEGIN CERTIFICATE-----\n"
+"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\n"
+"-----END CERTIFICATE-----\n"
+;
+
+const size_t ca_cert_len = sizeof(ca_cert) - 1; // Exclude null terminator
+
+void send_raw_data(const char *data, size_t len) {
+    printk("--- Sending raw data (%d bytes) ---\n", len);
+    for (size_t i = 0; i < len; i++) {
+        uart_poll_out(uart0, data[i]);
+    }
+    printk("--- Raw data sent ---\n");
+}
+
+bool download_and_convert_certificate(void) {
+    printk("Setting up certificate for HTTPS...\n");
+
+    send_at_command("AT+CFSINIT");
+    k_sleep(K_SECONDS(1));
+    
+    char cmd_buf[100];
+    snprintf(cmd_buf, sizeof(cmd_buf), "AT+CFSDFILE=3,\"%s\"", CA_CERT_FILE);
+    send_at_command(cmd_buf);
+    k_sleep(K_SECONDS(1));
+
+    // Send the write command
+    snprintf(cmd_buf, sizeof(cmd_buf), "AT+CFSWFILE=3,\"%s\",0,%d,10000", 
+             CA_CERT_FILE, ca_cert_len);
+    printk(">>> %s\n", cmd_buf);
+    for (int i = 0; cmd_buf[i] != '\0'; i++) {
+        uart_poll_out(uart0, cmd_buf[i]);
+    }
+    uart_poll_out(uart0, '\r');
+    
+    // Wait exactly 2 seconds for DOWNLOAD, then send regardless
+    k_sleep(K_SECONDS(2));
+    
+    printk("Sending certificate data...\n");
+    for (size_t i = 0; i < ca_cert_len; i++) {
+        uart_poll_out(uart0, ca_cert[i]);
+    }
+    
+    // Wait for OK
+    k_sleep(K_SECONDS(3));
+    
+    send_at_command("AT+CFSTERM");
+    k_sleep(K_SECONDS(1));
+
+    snprintf(cmd_buf, sizeof(cmd_buf), "AT+CSSLCFG=\"convert\",2,\"%s\"", CA_CERT_FILE);
+    send_at_command(cmd_buf);
+    if (!wait_for_ok_error(K_SECONDS(10))) {
+        return false;
+    }
+
+    return true;
+}
+
+
 void button_pressed_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     printk("Button pressed! Starting communication test...\n");
@@ -267,78 +355,29 @@ bool setup_network(void) {
     return true;
 }
 
-bool download_and_convert_certificate(void) {
-    printk("Setting up certificate for HTTPS...\n");
-    
-    // Note: This is a simplified version. You need to:
-    // 1. Actually download the CA certificate for your server
-    // 2. Convert it to the module's format
-    // 3. Store it in the module's file system
-    
-    // For now, we'll skip certificate verification as a temporary solution
-    // This is INSECURE but may work for testing
-    
-    printk("WARNING: Skipping certificate verification (INSECURE)\n");
-    //return true;
-    
-    // Proper certificate handling (commented out for now):
-    
-    // Initialize file system
-    send_at_command("AT+CFSINIT");
-    if (!wait_for_ok_error(K_SECONDS(5))) {
-        printk("File system init failed\n");
-        return false;
-    }
-    
-    // Download certificate (you need the actual certificate data)
-    // This is just a template - you need to provide the actual certificate
-    send_at_command("AT+CFSWFILE=3,\"server_ca.cer\",0,1492,1000");
-    if (!wait_for_ok_error(K_SECONDS(10))) {
-        printk("Certificate download failed\n");
-        send_at_command("AT+CFSTERM");
-        return false;
-    }
-    
-    // Terminate file system
-    send_at_command("AT+CFSTERM");
-    if (!wait_for_ok_error(K_SECONDS(5))) {
-        printk("File system terminate failed\n");
-        return false;
-    }
-    
-    // Convert certificate
-    send_at_command("AT+CSSLCFG=\"convert\",2,\"server_ca.cer\"");
-    if (!wait_for_ok_error(K_SECONDS(5))) {
-        printk("Certificate conversion failed\n");
-        return false;
-    }
-    
-    printk("Certificate setup complete\n");
-    return true;
-    
-}
-
 bool setup_https_session(void) {
     printk("Setting up HTTPS session...\n");
     
     // Clean up any existing session first
     cleanup_http_session();
-    
-    // Setup certificate (or skip verification)
+
+    // Setup certificate
     if (!download_and_convert_certificate()) {
-        printk("Certificate setup failed, trying without verification\n");
+        printk("FATAL: Certificate setup failed. Cannot proceed securely.\n");
+        return false; 
     }
-    
+
     // Configure SSL - Using TLS 1.2
     send_at_command("AT+CSSLCFG=\"sslversion\",1,3");
     if (!wait_for_ok_error(K_SECONDS(3))) {
         printk("SSL version configuration failed\n");
         return false;
     }
-    
-    // Skip certificate verification for now (empty string)
-    // In production, use the actual certificate: AT+SHSSL=1,"server_ca.cer"
-    send_at_command("AT+SHSSL=1,\"\"");
+
+    // IMPORTANT: Use the certificate for verification
+    char ssl_cmd[100];
+    snprintf(ssl_cmd, sizeof(ssl_cmd), "AT+SHSSL=1,\"%s\"", CA_CERT_FILE);
+    send_at_command(ssl_cmd);
     if (!wait_for_ok_error(K_SECONDS(3))) {
         printk("SSL configuration failed\n");
         return false;
@@ -694,3 +733,43 @@ int main(void)
 
     return 0;
 }
+
+
+
+
+/*
+
+PEM CERTIFICATE ()
+
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+*/
