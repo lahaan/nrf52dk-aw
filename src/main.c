@@ -17,16 +17,18 @@ static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trig
 
 static struct gpio_callback button_cb_data;
 static bool start_networking = false;
+static bool expecting_http_body = false;
+static bool shreq_response_received = false;
 
 // Server configuration - USING HTTPS
 #define SERVER_URL "seven080-mcu-backend.onrender.com"
-#define SERVER_HOST "seven080-mcu-backend.onrender.com" // For Host header
+#define SERVER_HOST "seven080-mcu-backend.onrender.com"
 #define DEVICE_ID "device001"
 #define POLL_INTERVAL_SEC 10
 
-// Certificate configuration - you'll need to get the actual certificate
+// certs
 #define CA_CERT_FILE "server_ca.cer"
-#define CA_CERT_SIZE 2048 // Adjust based on actual certificate size
+#define CA_CERT_SIZE 2048
 
 // UART buffers - Increased sizes for HTTPS
 #define RX_BUF_SIZE 128
@@ -39,6 +41,7 @@ static bool response_complete = false;
 static bool waiting_for_response = false;
 static int last_http_status_code = 0;
 static int last_http_data_size = 0;
+static int x = 0;
 
 // Command buffer
 static char command_data[256];
@@ -84,24 +87,6 @@ const char ca_cert[] =
 "vepuoxtGzi4CZ68zJpiq1UvSqTbFJjtbD4seiMHl\n"
 "-----END CERTIFICATE-----\n";
 
-/*
-//Google GTS Root R4 certificate from pki.google.com (also doesn't work / fix SHCONN CME ERROR: 3 - also no clue why they're different) [PEM]
-const char ca_cert[] =
-"-----BEGIN CERTIFICATE-----\n"
-"MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD\n"
-"VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG\n"
-"A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw\n"
-"WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz\n"
-"IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi\n"
-"AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi\n"
-"QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR\n"
-"HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW\n"
-"BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D\n"
-"9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8\n"
-"p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
-"-----END CERTIFICATE-----\n";
-
-*/
 
 const size_t ca_cert_len = sizeof(ca_cert) - 1; // Exclude null terminator
 
@@ -116,7 +101,6 @@ bool download_and_convert_certificate(void) {
     send_at_command(cmd_buf);
     k_sleep(K_SECONDS(1));
 
-    // Send the write command
     snprintf(cmd_buf, sizeof(cmd_buf), "AT+CFSWFILE=3,\"%s\",0,%d,10000", 
              CA_CERT_FILE, ca_cert_len);
     printk(">>> %s\n", cmd_buf);
@@ -125,7 +109,6 @@ bool download_and_convert_certificate(void) {
     }
     uart_poll_out(uart0, '\r');
     
-    // Wait exactly 2 seconds for DOWNLOAD, then send regardless
     k_sleep(K_SECONDS(2));
     
     printk("Sending certificate data...\n");
@@ -155,7 +138,6 @@ void button_pressed_cb(const struct device *dev, struct gpio_callback *cb, uint3
     start_networking = true;
 }
 
-// Improved UART callback
 static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *user_data)
 {
     ARG_UNUSED(dev);
@@ -198,7 +180,8 @@ static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *
                                 last_http_status_code = atoi(comma1 + 1);
                                 last_http_data_size = atoi(comma2 + 1);
                                 printk("HTTPS Status: %d, Size: %d\n", 
-                                       last_http_status_code, last_http_data_size);
+                                    last_http_status_code, last_http_data_size);
+                                shreq_response_received = true;  // ADD THIS LINE
                             }
                         }
                         response_complete = true;
@@ -214,16 +197,19 @@ static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *
                         // The next line will contain the actual data
                     }
                     // Capture actual data after +SHREAD
-                    else if (waiting_for_response && last_http_data_size > 0 && 
-                             resp_len > 10 && response_buf[0] == '{') {
-                        // This looks like JSON data - store it
-                        if (resp_len < sizeof(command_data) - 1) {
+                    else if (expecting_http_body && resp_len > 0) {
+                    if (strcmp(response_buf, "OK") != 0 &&
+                        strcmp(response_buf, "ERROR") != 0 &&
+                        strncmp(response_buf, "+", 1) != 0) {
+
+                        if (resp_len < sizeof(command_data)) {
                             strncpy(command_data, response_buf, sizeof(command_data) - 1);
                             command_data[sizeof(command_data) - 1] = '\0';
                             command_received = true;
                             printk("Command data captured: %s\n", command_data);
                         }
                     }
+                }
                     resp_len = 0;
                 }
             } else if (c != '\r') {  // Ignore carriage returns
@@ -481,7 +467,7 @@ void poll_for_commands(void) {
         return;
     }
     
-    // Add headers as shown in app note
+    // Add headers
     send_at_command("AT+SHAHEAD=\"User-Agent\",\"nRF52-IoT-Controller\"");
     if (!wait_for_ok_error(K_SECONDS(2))) {
         printk("User-Agent header failed\n");
@@ -510,103 +496,113 @@ void poll_for_commands(void) {
         return;
     }
     
-    // Make GET request to poll endpoint - USING HTTPS
+    // Reset state before request
+    last_http_status_code = 0;
+    last_http_data_size = 0;
+    shreq_response_received = false;
+    
+    // Make GET request
     char poll_url[128];
     snprintf(poll_url, sizeof(poll_url), "AT+SHREQ=\"/api/poll/%s\",1", DEVICE_ID);
     send_at_command(poll_url);
     
+    // Wait for OK
     if (!wait_for_ok_error(K_SECONDS(30))) {
         printk("HTTPS request failed or timeout\n");
         cleanup_http_session();
         return;
     }
     
+    // NOW wait for the actual +SHREQ URC with status and size
+    printk("Waiting for +SHREQ response...\n");
+    int64_t start = k_uptime_get();
+    while (!shreq_response_received && (k_uptime_get() - start) < K_SECONDS(10).ticks) {
+        k_msleep(100);
+    }
+    
+    if (!shreq_response_received) {
+        printk("ERROR: +SHREQ response timeout!\n");
+        return;
+    }
+    
+    // NOW we have the correct size
+    int actual_data_size = last_http_data_size;
+    printk("Confirmed data size: %d\n", actual_data_size);
+    
     // Check if we got a successful response
-    if (last_http_status_code == 200 && last_http_data_size > 0) {
-        printk("Reading response data, size: %d\n", last_http_data_size);
+    if (last_http_status_code == 200 && actual_data_size > 0) {
+        printk("Reading response data, size: %d\n", actual_data_size);
         
-        // Read the response data
+        // Clear previous command data and flags
+        memset(command_data, 0, sizeof(command_data));
+        command_received = false;
+        resp_len = 0;
+        
+        expecting_http_body = true;
+
+        printk("Boutta READ packet n=%d\n",x++);
+        k_sleep(K_SECONDS(1)); // Give modem time to prepare data
+        
         char read_cmd[32];
-        int read_size = last_http_data_size;
-        if (read_size > 500) read_size = 500; // Conservative limit
-        
-        snprintf(read_cmd, sizeof(read_cmd), "AT+SHREAD=0,%d", read_size);
+        snprintf(read_cmd, sizeof(read_cmd), "AT+SHREAD=0,%d", actual_data_size);
         send_at_command(read_cmd);
         
-        // Wait for data with longer timeout
-        command_received = false;
-        if (wait_for_ok_error(K_SECONDS(10)) && command_received) {
+        // Wait for the OK response to AT+SHREAD command
+        if (!wait_for_ok_error(K_SECONDS(3))) {
+            printk("AT+SHREAD command failed\n");
+            expecting_http_body = false;
+            return;
+        }
+        
+        // Now wait for the actual data to arrive in the UART callback
+        start = k_uptime_get();
+        while (!command_received && (k_uptime_get() - start) < K_SECONDS(3).ticks) {
+            k_msleep(50);
+        }
+
+        expecting_http_body = false;
+
+        if (command_received) {
             printk("Received command: %s\n", command_data);
             process_command(command_data);
             
-            // Send acknowledgment - USING HTTPS
+            // Send acknowledgment
             char ack_url[128];
             snprintf(ack_url, sizeof(ack_url), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
             send_at_command(ack_url);
-            wait_for_ok_error(K_SECONDS(10));
+            wait_for_ok_error(K_SECONDS(7));
         } else {
-            printk("No command data received\n");
+            printk("No command data received within timeout\n");
         }
     } else {
-        printk("No commands available (Status: %d)\n", last_http_status_code);
+        printk("No commands available (Status: %d, Size: %d)\n", 
+               last_http_status_code, actual_data_size);
     }
+    
+    // Add small delay between polls
+    k_msleep(500);
 }
 
 void process_command(const char *response) {
     printk("Processing command: %s\n", response);
-    
-    // Simple JSON parsing - look for command structure
-    if (strstr(response, "NOCMD") != NULL || strstr(response, "no command") != NULL) {
+
+    if (strstr(response, "NOCMD") != NULL) {
         printk("No commands waiting\n");
         return;
     }
-    
-    // Extract command, pin, and data from JSON
-    // Expected format: {"command":"LED_ON","pin":17,"data":"some_data"}
+
+    // Expected format: CMD:TOGGLE,PIN:17,DATA:none
     char cmd[32] = {0};
     int pin = 0;
     char data[64] = {0};
-    
-    // Parse command
-    const char *cmd_start = strstr(response, "\"command\":\"");
-    if (cmd_start) {
-        cmd_start += 11; // Skip "\"command\":\""
-        const char *cmd_end = strchr(cmd_start, '\"');
-        if (cmd_end) {
-            int len = cmd_end - cmd_start;
-            if (len < sizeof(cmd)) {
-                strncpy(cmd, cmd_start, len);
-                cmd[len] = '\0';
-            }
-        }
-    }
-    
-    // Parse pin
-    const char *pin_start = strstr(response, "\"pin\":");
-    if (pin_start) {
-        pin_start += 6; // Skip "\"pin\":"
-        pin = atoi(pin_start);
-    }
-    
-    // Parse data
-    const char *data_start = strstr(response, "\"data\":\"");
-    if (data_start) {
-        data_start += 8; // Skip "\"data\":\""
-        const char *data_end = strchr(data_start, '\"');
-        if (data_end) {
-            int len = data_end - data_start;
-            if (len < sizeof(data)) {
-                strncpy(data, data_start, len);
-                data[len] = '\0';
-            }
-        }
-    }
-    
-    if (strlen(cmd) > 0) {
+
+    // Parse CMD:...
+    if (sscanf(response, "CMD:%31[^,],PIN:%d,DATA:%63s", cmd, &pin, data) == 3) {
+        // sscanf reads "none" as string — that's fine
         printk("Parsed - CMD: %s, PIN: %d, DATA: %s\n", cmd, pin, data);
         execute_command(cmd, pin, data);
     } else {
-        printk("No valid command found in response\n");
+        printk("Failed to parse command string\n");
     }
 }
 
@@ -706,7 +702,6 @@ int main(void)
         return 0;
     }
 
-    /* Register UART callback and enable RX */
     uart_callback_set(uart0, uart_evt_cb, NULL);
     int err = uart_rx_enable(uart0, rx_buf, sizeof(rx_buf), RX_TIMEOUT_DELAY);
     if (err) {
@@ -714,7 +709,6 @@ int main(void)
         return 0;
     }
 
-    /* Configure GPIOs */
     if (gpio_is_ready_dt(&led0)) {
         err = gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
         if (err) {
