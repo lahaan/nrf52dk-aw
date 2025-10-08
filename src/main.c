@@ -773,3 +773,257 @@ int main(void)
 
     return 0;
 }
+
+
+/*
+
+chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,uart-mcumgr = &uart0;
+		zephyr,bt-mon-uart = &uart0;
+		zephyr,bt-c2h-uart = &uart0;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led0: led_0 {
+			gpios = <&gpio0 17 GPIO_ACTIVE_LOW>;
+			label = "Green LED 0";
+		};
+
+		led1: led_1 {
+			gpios = <&gpio0 18 GPIO_ACTIVE_LOW>;
+			label = "Green LED 1";
+		};
+
+		led2: led_2 {
+			gpios = <&gpio0 19 GPIO_ACTIVE_LOW>;
+			label = "Green LED 2";
+		};
+
+		led3: led_3 {
+			gpios = <&gpio0 20 GPIO_ACTIVE_LOW>;
+			label = "Green LED 3";
+		};
+	};
+
+	pwmleds {
+		compatible = "pwm-leds";
+
+		pwm_led0: pwm_led_0 {
+			pwms = <&pwm0 0 PWM_MSEC(20) PWM_POLARITY_INVERTED>;
+		};
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		wakeup-source;
+
+		button0: button_0 {
+			gpios = <&gpio0 13 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+
+		button1: button_1 {
+			gpios = <&gpio0 14 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 1";
+			zephyr,code = <INPUT_KEY_1>;
+		};
+
+		button2: button_2 {
+			gpios = <&gpio0 15 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 2";
+			zephyr,code = <INPUT_KEY_2>;
+		};
+
+		button3: button_3 {
+			gpios = <&gpio0 16 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 3";
+			zephyr,code = <INPUT_KEY_3>;
+		};
+	};
+
+	gpio_trigger {
+		compatible = "gpio-leds";
+		trigger_pin: trigger_0 {
+			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+			label = "Wakeup Trigger Pin"; //sbc wakeup
+		};
+		trigger_pin2: trigger_1 {
+			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+			label = "Wakeup Trigger Pin 2"; //modem wakeup
+		};
+
+	};
+
+	gpio_wake {
+		compatible = "gpio-keys";
+		wakeup-source;
+		wake_pin: wake_pin {
+			gpios = <&gpio0 28 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Wakeup Pin"; //sbc interrupting sbc for wake
+			zephyr,code = <INPUT_KEY_4>;
+		};
+	};
+
+////////ARDUINO HEADER, ADC////////////
+
+
+aliases {
+		led0 = &led0;
+		led1 = &led1;
+		led2 = &led2;
+		led3 = &led3;
+		pwm-led0 = &pwm_led0;
+		sw0 = &button0;
+		sw1 = &button1;
+		sw2 = &button2;
+		sw3 = &button3;
+		bootloader-led0 = &led0;
+		mcuboot-button0 = &button0;
+		mcuboot-led0 = &led0;
+		watchdog0 = &wdt0;
+		trigger0 = &trigger_pin;
+		trigger1 = &trigger_pin2;
+		wakepin = &wake_pin;
+		modem = &sim7080;
+	};
+
+&reg {
+	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+};
+
+&adc {
+	status = "okay";
+};
+
+&uicr {
+	gpio-as-nreset;
+};
+
+&nfct {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+//SIM7080 PART IS UNNECESSARY NOW, HANDLING IT RAW NOW
+
+arduino_serial: &uart0 {
+	status = "okay";
+	compatible = "nordic,nrf-uarte";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart0_default>;
+	pinctrl-1 = <&uart0_sleep>;
+	pinctrl-names = "default", "sleep";
+	
+	#address-cells = <1>;
+	#size-cells = <0>;
+	
+	sim7080: modem@0 {
+			compatible = "simcom,sim7080";
+			reg = <0>;
+			mdm-power-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>; 
+			status = "okay";
+		};
+};
+
+arduino_i2c: &i2c0 {
+	compatible = "nordic,nrf-twi";
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&i2c1 {
+	compatible = "nordic,nrf-twi";
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-1 = <&i2c1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&pwm0 {
+	status = "okay";
+	pinctrl-0 = <&pwm0_default>;
+	pinctrl-1 = <&pwm0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&spi0 {
+	compatible = "nordic,nrf-spi";
+	pinctrl-0 = <&spi0_default>;
+	pinctrl-1 = <&spi0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&spi1 {
+	compatible = "nordic,nrf-spi";
+	status = "okay";
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+arduino_spi: &spi2 {
+	compatible = "nordic,nrf-spi";
+	status = "okay";
+	cs-gpios = <&arduino_header 16 GPIO_ACTIVE_LOW>; 
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0xc000>;
+		};
+
+		slot0_partition: partition@c000 {
+			label = "image-0";
+			reg = <0x0000C000 0x37000>;
+		};
+
+		slot1_partition: partition@43000 {
+			label = "image-1";
+			reg = <0x00043000 0x37000>;
+		};
+
+		storage_partition: partition@7a000 {
+			label = "storage";
+			reg = <0x0007a000 0x00006000>;
+		};
+	};
+};
+
+&ccm {
+	status = "disabled";
+};
+
+&ecb {
+	status = "disabled";
+};
+
+&rng {
+	status = "okay";
+};
+
+*/
