@@ -1,3 +1,23 @@
+/*
+
+v1.0-081025
+HTTPS POLLING SIM7080-NRF52832DK
+    Works via setting up networking (APN), then HTTPS session w/ certs
+    Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
+    Backend sends NOCMD if no commands pending
+    1-2s (or at least 800ms) delay before AT+SHREAD (after SHREQ) is critical to avoid CME ERROR 3
+
+    Modem PWRKEY & interrupt pin from SBC not added yet (todo) + cleanup needed to do (unndeed includes/defines, comments, code etc)
+    More notes:
+     *Initial setup can be sped up
+     *Debug prints & delays can be removed &or reduced
+     *Cert doesn't have to be sent everytime (could be in main / everytime the modem boots, perhaps implement w/ PWRKEY pin logic)
+
+    .dts added below (bottom) as git doesn't track it
+*/
+
+
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
@@ -7,20 +27,21 @@
 #include <stdlib.h>
 
 // UART & GPIO
-const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0));
+const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0)); //P0.06=TX, P0.08=RX
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
 // Control pins
-static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0});
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios); //oboard LED1
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios); //oboard LED2
+static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); //P0.11 to SBC (defined in dts)
+
 
 static struct gpio_callback button_cb_data;
 static bool start_networking = false;
 static bool expecting_http_body = false;
 static bool shreq_response_received = false;
 
-// Server configuration - USING HTTPS
+// Server config
 #define SERVER_URL "seven080-mcu-backend.onrender.com"
 #define SERVER_HOST "seven080-mcu-backend.onrender.com"
 #define DEVICE_ID "device001"
@@ -30,12 +51,13 @@ static bool shreq_response_received = false;
 #define CA_CERT_FILE "server_ca.cer"
 #define CA_CERT_SIZE 2048
 
-// UART buffers - Increased sizes for HTTPS
-#define RX_BUF_SIZE 128
+// UART buffers
+#define RX_BUF_SIZE 128 // MAX buffer that the 52832 can handle over UART without crashing tf out
 #define RESPONSE_BUF_SIZE 1024  // Increased for HTTPS responses
 static int32_t RX_TIMEOUT_DELAY = 500;
 static uint8_t rx_buf[RX_BUF_SIZE];
 static char response_buf[RESPONSE_BUF_SIZE];
+
 static size_t resp_len = 0;
 static bool response_complete = false;
 static bool waiting_for_response = false;
@@ -63,7 +85,7 @@ void poll_for_commands(void);
 void process_command(const char *response);
 void execute_command(const char *cmd, int pin, const char *data);
 
-//Google GTS4 CA certificate from openssl [PEM]
+// Google GTS4 CA certificate from openssl [PEM]
 const char ca_cert[] =
 "-----BEGIN CERTIFICATE-----\n"
 "MIIDejCCAmKgAwIBAgIQf+UwvzMTQ77dghYQST2KGzANBgkqhkiG9w0BAQsFADBX\n"
@@ -88,16 +110,24 @@ const char ca_cert[] =
 "-----END CERTIFICATE-----\n";
 
 
-const size_t ca_cert_len = sizeof(ca_cert) - 1; // Exclude null terminator
+const size_t ca_cert_len = sizeof(ca_cert) - 1;
 
 bool download_and_convert_certificate(void) {
+    /*
+    AT+CFSINIT - Get flash data buffer (initialize)
+    AT+CFSDFILE=3,"server_ca.cer" - Define file in flash
+    AT+CFSWFILE=3,"server_ca.cer",0,2048,10000 - Write file (2048 bytes max here)
+    AT+CFSTERM - Free the flash buffer allocated by CFSINIT
+    AT+CSSLCFG="convert",2,"server_ca.cer" - Convert the PEM to internal format (Configure SSL params of a context identifier)
+    */
+
     printk("Setting up certificate for HTTPS...\n");
 
-    send_at_command("AT+CFSINIT");
+    send_at_command("AT+CFSINIT"); // Get flash data buffer (initialize)
     k_sleep(K_SECONDS(1));
     
     char cmd_buf[100];
-    snprintf(cmd_buf, sizeof(cmd_buf), "AT+CFSDFILE=3,\"%s\"", CA_CERT_FILE);
+    snprintf(cmd_buf, sizeof(cmd_buf), "AT+CFSDFILE=3,\"%s\"", CA_CERT_FILE); 
     send_at_command(cmd_buf);
     k_sleep(K_SECONDS(1));
 
@@ -116,8 +146,7 @@ bool download_and_convert_certificate(void) {
         uart_poll_out(uart0, ca_cert[i]);
     }
     
-    // Wait for OK
-    k_sleep(K_SECONDS(3));
+    k_sleep(K_SECONDS(3)); 
 
     send_at_command("AT+CFSTERM");
     k_sleep(K_SECONDS(1));
@@ -278,13 +307,22 @@ bool wait_for_response_with_timeout(const char *expected, k_timeout_t timeout) {
 }
 
 bool setup_network(void) {
+    /*
+    AT+CMEE=2 - Enable verbose errors
+    AT - Init, ATE0 - echo off
+    AT+GMR - Request TA revision identification of software release
+    AT+CPIN? - OK if PSWD required (NOT) else WRITE (in our case it's fine)
+    AT+CGREG=1 - Enable network registration unsolicitated result code
+    AT+CGREG? - Check registration status (1,1 or 1,5 = registered)
+    AT+CGDCONT=1,"IP","internet.telia.ee" - Define PDP context (APN)
+    AT+CNACT=0,1 - Activate PDP context (APP Network Active)
+    */
+
     printk("Setting up network...\n");
     
-    // Enable verbose errors
     send_at_command("AT+CMEE=2");
     if (!wait_for_ok_error(K_SECONDS(2))) return false;
     
-    // Basic modem init
     send_at_command("AT");
     if (!wait_for_ok_error(K_SECONDS(2))) return false;
     
@@ -293,15 +331,13 @@ bool setup_network(void) {
     
     send_at_command("AT+GMR");
     k_sleep(K_SECONDS(2));
-    // Check SIM
+
     send_at_command("AT+CPIN?");
     if (!wait_for_response_with_timeout("READY", K_SECONDS(2))) return false;
     
-    // Network registration
     send_at_command("AT+CGREG=1");
     if (!wait_for_ok_error(K_SECONDS(2))) return false;
     
-    // Wait for registration
     bool registered = false;
     for (int i = 0; i < 15; i++) {
         send_at_command("AT+CGREG?");
@@ -319,21 +355,17 @@ bool setup_network(void) {
         return false;
     }
     
-    // Set APN
     send_at_command("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"");
     if (!wait_for_ok_error(K_SECONDS(3))) return false;
     
-    // Activate PDP context
     send_at_command("AT+CNACT=0,1");
     if (!wait_for_ok_error(K_SECONDS(15))) {
-        // Check if already active
         send_at_command("AT+CNACT?");
         if (!wait_for_response_with_timeout("+CNACT: 0,1", K_SECONDS(2))) {
             return false;
         }
     }
-    
-    // Check if active
+
     send_at_command("AT+CNACT?");
     if (!wait_for_response_with_timeout("+CNACT: 0,1", K_SECONDS(2))) {
         return false;
@@ -345,9 +377,23 @@ bool setup_network(void) {
 }
 
 bool setup_https_session(void) {
+    /*
+    CSSLCFG: Configure SSL params of a context identifier
+    AT+CSSLCFG="ignorertctime",1,1 - Ignore RTC time check (1=ignore), could also set time/ignore this (time has been set to 2025 oct 1 as of v1.0-081025)
+    AT+CSSLCFG="sslversion",1,3 - Set SSL version to TLS 1.2 (3)
+    AT+CSSLCFG="sni",1,"seven080-mcu-backend.onrender.com" - Set SNI
+    AT+SHSSL=1,"server_ca.cer" - Use the certificate for verification
+    AT+SHCONF="URL","https://seven080-mcu-backend.onrender.com" - Set URL (HTTPS)
+    AT+SHCONF="BODYLEN",1024 - Set body length
+    AT+SHCONF="HEADERLEN",350 - Set header length
+    AT+CDNSGIP="seven080-mcu-backend.onrender.com" - Test DNS resolution
+    AT+SHCONN - Connect HTTPS session [main part, can take time]
+    AT+SHSTATE? - Check state (1=connected)
+    7s timeout for SHCONN seems to work ok, 10s+ safer
+    */
+
     printk("Setting up HTTPS session...\n");
-    
-    // Clean up any existing session first
+    // Clean session
     cleanup_http_session();
 
     send_at_command("AT+CSSLCFG=\"ignorertctime\",1,1");
@@ -369,7 +415,6 @@ bool setup_https_session(void) {
     send_at_command("AT+CSSLCFG=\"sni\",1,\"seven080-mcu-backend.onrender.com\"");
     k_sleep(K_MSEC(500));
 
-    // IMPORTANT: Use the certificate for verification
     char ssl_cmd[100];
     snprintf(ssl_cmd, sizeof(ssl_cmd), "AT+SHSSL=1,\"%s\"", CA_CERT_FILE);
     send_at_command(ssl_cmd);
@@ -378,10 +423,7 @@ bool setup_https_session(void) {
         return false;
     }
     
-    // Configure HTTPS parameters with larger buffers
     char cmd[128];
-    
-    // Set URL - USING HTTPS
     snprintf(cmd, sizeof(cmd), "AT+SHCONF=\"URL\",\"https://%s\"", SERVER_URL);
     send_at_command(cmd);
     if (!wait_for_ok_error(K_SECONDS(3))) {
@@ -389,7 +431,6 @@ bool setup_https_session(void) {
         return false;
     }
     
-    // Use larger buffer sizes as shown in app note
     send_at_command("AT+SHCONF=\"BODYLEN\",1024");
     if (!wait_for_ok_error(K_SECONDS(3))) {
         printk("BODYLEN configuration failed\n");
@@ -411,17 +452,15 @@ bool setup_https_session(void) {
     }
     k_sleep(K_SECONDS(2));
 
-    // Connect HTTPS session
+    // CONNECTION
     send_at_command("AT+SHCONN");
-    if (!wait_for_ok_error(K_SECONDS(30))) {  // Increased timeout for HTTPS
+    if (!wait_for_ok_error(K_SECONDS(30))) {
         printk("HTTPS connection failed\n");
         return false;
     }
 
     k_sleep(K_SECONDS(2));
 
-    
-    // Check state
     send_at_command("AT+SHSTATE?");
     if (!wait_for_response_with_timeout("+SHSTATE: 1", K_SECONDS(5))) {
         printk("HTTPS session not active\n");
@@ -467,7 +506,6 @@ void poll_for_commands(void) {
         return;
     }
     
-    // Add headers
     send_at_command("AT+SHAHEAD=\"User-Agent\",\"nRF52-IoT-Controller\"");
     if (!wait_for_ok_error(K_SECONDS(2))) {
         printk("User-Agent header failed\n");
@@ -496,24 +534,20 @@ void poll_for_commands(void) {
         return;
     }
     
-    // Reset state before request
     last_http_status_code = 0;
     last_http_data_size = 0;
     shreq_response_received = false;
     
-    // Make GET request
     char poll_url[128];
     snprintf(poll_url, sizeof(poll_url), "AT+SHREQ=\"/api/poll/%s\",1", DEVICE_ID);
     send_at_command(poll_url);
     
-    // Wait for OK
     if (!wait_for_ok_error(K_SECONDS(30))) {
         printk("HTTPS request failed or timeout\n");
         cleanup_http_session();
         return;
     }
     
-    // NOW wait for the actual +SHREQ URC with status and size
     printk("Waiting for +SHREQ response...\n");
     int64_t start = k_uptime_get();
     while (!shreq_response_received && (k_uptime_get() - start) < K_SECONDS(10).ticks) {
@@ -525,11 +559,10 @@ void poll_for_commands(void) {
         return;
     }
     
-    // NOW we have the correct size
     int actual_data_size = last_http_data_size;
     printk("Confirmed data size: %d\n", actual_data_size);
     
-    // Check if we got a successful response
+    // success?
     if (last_http_status_code == 200 && actual_data_size > 0) {
         printk("Reading response data, size: %d\n", actual_data_size);
         
@@ -579,7 +612,6 @@ void poll_for_commands(void) {
                last_http_status_code, actual_data_size);
     }
     
-    // Add small delay between polls
     k_msleep(500);
 }
 
@@ -591,14 +623,11 @@ void process_command(const char *response) {
         return;
     }
 
-    // Expected format: CMD:TOGGLE,PIN:17,DATA:none
+    //format: CMD:TOGGLE,PIN:17,DATA:none
     char cmd[32] = {0};
     int pin = 0;
     char data[64] = {0};
-
-    // Parse CMD:...
     if (sscanf(response, "CMD:%31[^,],PIN:%d,DATA:%63s", cmd, &pin, data) == 3) {
-        // sscanf reads "none" as string — that's fine
         printk("Parsed - CMD: %s, PIN: %d, DATA: %s\n", cmd, pin, data);
         execute_command(cmd, pin, data);
     } else {
@@ -667,24 +696,20 @@ void execute_command(const char *cmd, int pin, const char *data) {
     }
 }
 
-// Main polling thread
 void polling_thread(void) {
     printk("Starting polling thread...\n");
     
-    // Wait for button press to start networking
     while (!start_networking) {
         k_sleep(K_MSEC(100));
     }
     
     printk("Button triggered networking start!\n");
     
-    // Setup network
     if (!setup_network()) {
         printk("Network setup failed!\n");
         return;
     }
     
-    // Main polling loop
     while (1) {
         poll_for_commands();
         k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
