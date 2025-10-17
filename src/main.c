@@ -58,6 +58,8 @@ static int32_t RX_TIMEOUT_DELAY = 500;
 static uint8_t rx_buf[RX_BUF_SIZE];
 static char response_buf[RESPONSE_BUF_SIZE];
 
+static int BAUD_RATE = 921600;
+
 static size_t resp_len = 0;
 static bool response_complete = false;
 static bool waiting_for_response = false;
@@ -310,6 +312,7 @@ bool setup_network(void) {
     /*
     AT+CMEE=2 - Enable verbose errors
     AT - Init, ATE0 - echo off
+    AT+IPR - Set baud rate (sbc is 921600 since CATM1 7080 upload is up to 1Mbps)
     AT+GMR - Request TA revision identification of software release
     AT+CPIN? - OK if PSWD required (NOT) else WRITE (in our case it's fine)
     AT+CGREG=1 - Enable network registration unsolicitated result code
@@ -329,6 +332,11 @@ bool setup_network(void) {
     send_at_command("ATE0");
     if (!wait_for_ok_error(K_SECONDS(2))) return false;
     
+    char ipr_cmd[32];
+    snprintf(ipr_cmd, sizeof(ipr_cmd), "AT+IPR=%d", BAUD_RATE);
+    send_at_command(ipr_cmd);
+    if (!wait_for_ok_error(K_SECONDS(2))) return false;
+
     send_at_command("AT+GMR");
     k_sleep(K_SECONDS(2));
 
@@ -656,20 +664,20 @@ void execute_command(const char *cmd, int pin, const char *data) {
             printk("LED TOGGLED\n");
         }
     }
-    else if (strcmp(cmd, "BOOT") == 0) {
+    else if (strcmp(cmd, "BOOT") == 0) { //changed from LO-HI-LO to HI-LO-HI as per SBC req (sbc default 3.3v pull none, active none)
         if (gpio_is_ready_dt(&trigger_pin)) {
             printk("Triggering SBC boot sequence...\n");
-            gpio_pin_set_dt(&trigger_pin, 1);
-            k_sleep(K_SECONDS(1));
             gpio_pin_set_dt(&trigger_pin, 0);
+            k_sleep(K_MSEC(250));
+            gpio_pin_set_dt(&trigger_pin, 1);
             printk("Boot trigger complete\n");
         }
     }
-    else if (strcmp(cmd, "PULSE") == 0) {
+    else if (strcmp(cmd, "PULSE") == 0) { //500ms
         if (pin == 11 && gpio_is_ready_dt(&trigger_pin)) {
-            gpio_pin_set_dt(&trigger_pin, 1);
-            k_sleep(K_MSEC(500));
             gpio_pin_set_dt(&trigger_pin, 0);
+            k_sleep(K_MSEC(500));
+            gpio_pin_set_dt(&trigger_pin, 1);
             printk("Pulsed pin %d\n", pin);
         }
     }
@@ -769,6 +777,7 @@ int main(void)
         gpio_init_callback(&button_cb_data, button_pressed_cb, BIT(button.pin));
         gpio_add_callback(button.port, &button_cb_data);
         printk("Button configured with interrupt\n");
+        gpio_pin_set_dt(&trigger_pin, 1);
     }
 
     return 0;
