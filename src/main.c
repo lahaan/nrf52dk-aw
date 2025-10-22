@@ -39,7 +39,7 @@ static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trig
 
 static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios); //MCU P0.28 << P32 SBC [handoff signal]
 
-
+static struct k_work sbc_handoff_work;
 static struct gpio_callback button_cb_data;
 static bool start_networking = false;
 static bool expecting_http_body = false;
@@ -265,6 +265,7 @@ bool psm_disable(void) {
         printk("Failed to disable PSM\n");
         return false;
     }
+    psm_state = false;
     return true;
 }
 
@@ -274,6 +275,7 @@ bool edrx_disable(void) {
         printk("Failed to disable eDRX\n");
         return false;
     }
+    edrx_state = false;
     return true;
 }
 
@@ -1237,4 +1239,234 @@ arduino_spi: &spi2 {
 	status = "okay";
 };
 
+*/
+
+/*
+v1.1-221025 log rtt:
+00> *** Booting nRF Connect SDK v3.1.0-6c6e5b32496e ***
+00> *** Using Zephyr OS v4.1.99-1612683d4010 ***
+00> IoT Controller Starting...
+00> Button configured with interrupt
+00> SBC handoff pin configured with falling-edge interrupt
+00> Starting polling thread...
+00> <<< NORMAL POWER DOWN
+00> <<< ~}#À!}%}(} }$#[~
+00> <<< RDY
+00> <<< +CFUN: 1
+00> <<< +CPIN: READY
+00> <<< SMS Ready
+00> Button pressed! Starting communication test...
+00> Button triggered networking start!
+00> Setting up network...
+00> >>> AT+CMEE=2
+00> <<< AT+CMEE=2
+00> <<< OK
+00> >>> AT
+00> <<< AT
+00> <<< OK
+00> >>> ATE0
+00> <<< ATE0
+00> <<< OK
+00> >>> AT+IPR=921600
+00> <<< OK
+00> >>> AT+GMR
+00> <<< Revision:1951B16SIM7080
+00> <<< OK
+00> >>> AT+CPIN?
+00> <<< +CPIN: READY
+00> <<< OK
+00> >>> AT+CGREG=1
+00> <<< OK
+00> >>> AT+CGREG?
+00> <<< +CGREG: 1,1
+00> <<< OK
+00> Network registered!
+00> >>> AT+CGDCONT=1,"IP","internet.telia.ee"
+00> <<< OK
+00> >>> AT+CNACT=0,1
+00> <<< OK
+00> <<< +APP PDP: 0,ACTIVE
+00> >>> AT+CNACT?
+00> <<< +CNACT: 0,1,"10.52.204.103"
+00> <<< +CNACT: 1,0,"0.0.0.0"
+00> <<< +CNACT: 2,0,"0.0.0.0"
+00> <<< +CNACT: 3,0,"0.0.0.0"
+00> <<< OK
+00> Network setup complete
+00> Setting up HTTPS session...
+00> >>> AT+CSSLCFG="ignorertctime",1,1
+00> <<< OK
+00> Setting up certificate for HTTPS...
+00> >>> AT+CFSINIT
+00> <<< OK
+00> >>> AT+CFSDFILE=3,"server_ca.cer"
+00> <<< OK
+00> >>> AT+CFSWFILE=3,"server_ca.cer",0,1265,10000
+00> <<< DOWNLOAD
+00> Sending certificate data...
+00> <<< OK
+00> >>> AT+CFSTERM
+00> <<< OK
+00> >>> AT+CSSLCFG="convert",2,"server_ca.cer"
+00> <<< OK
+00> >>> AT+CSSLCFG="sslversion",1,3
+00> <<< OK
+00> >>> AT+CSSLCFG="sni",1,"seven080-mcu-backend.onrender.com"
+00> <<< OK
+00> >>> AT+SHSSL=1,"server_ca.cer"
+00> <<< OK
+00> >>> AT+SHCONF="URL","https://seven080-mcu-backend.onrender.com"
+00> <<< OK
+00> >>> AT+SHCONF="BODYLEN",1024
+00> <<< OK
+00> >>> AT+SHCONF="HEADERLEN",350
+00> <<< OK
+00> Testing DNS resolution...
+00> >>> AT+CDNSGIP="seven080-mcu-backend.onrender.com"
+00> <<< OK
+00> DNS resolution successful
+00> <<< +CDNSGIP: 1,"seven080-mcu-backend.onrender.com","216.24.57.7"
+00> >>> AT+SHCONN
+00> <<< OK
+00> >>> AT+SHSTATE?
+00> <<< +SHSTATE: 1
+00> HTTPS Session State: Connected
+00> <<< OK
+00> HTTPS session setup complete
+00> Polling for commands...
+00> >>> AT+SHCHEAD
+00> <<< OK
+00> >>> AT+SHCPARA
+00> <<< OK
+00> >>> AT+SHAHEAD="User-Agent","nRF52-IoT-Controller"
+00> <<< OK
+00> >>> AT+SHAHEAD="Accept","/"
+00> <<< OK
+00> >>> AT+SHAHEAD="Cache-control","no-cache"
+00> <<< OK
+00> >>> AT+SHAHEAD="Connection","keep-alive"
+00> <<< OK
+00> >>> AT+SHREQ="/api/poll/device001",1
+00> <<< OK
+00> Waiting for +SHREQ response...
+00> <<< +SHREQ: "GET",200,27
+00> HTTPS Status: 200, Size: 27
+00> Confirmed data size: 27
+00> Reading response data, size: 27
+00> Boutta READ packet n=0
+00> >>> AT+SHREAD=0,27
+00> <<< OK
+00> <<< +SHREAD: 27
+00> <<< CMD:LED_ON,PIN:17,DATA:none
+00> Command data captured: CMD:LED_ON,PIN:17,DATA:none
+00> Received command: CMD:LED_ON,PIN:17,DATA:none
+00> Processing command: CMD:LED_ON,PIN:17,DATA:none
+00> Parsed - CMD: LED_ON, PIN: 17, DATA: none
+00> Executing: LED_ON on pin 17
+00> LED ON
+00> >>> AT+SHREQ="/api/ack/device001/OK",1
+00> <<< OK
+00> <<< +SHREQ: "GET",200,2
+00> HTTPS Status: 200, Size: 2
+00> Polling for commands...
+00> >>> AT+SHCHEAD
+00> <<< OK
+00> >>> AT+SHCPARA
+00> <<< OK
+00> >>> AT+SHAHEAD="User-Agent","nRF52-IoT-Controller"
+00> <<< OK
+00> >>> AT+SHAHEAD="Accept","/"
+00> <<< OK
+00> >>> AT+SHAHEAD="Cache-control","no-cache"
+00> <<< OK
+00> >>> AT+SHAHEAD="Connection","keep-alive"
+00> <<< OK
+00> >>> AT+SHREQ="/api/poll/device001",1
+00> <<< OK
+00> Waiting for +SHREQ response...
+00> <<< +SHREQ: "GET",200,5
+00> HTTPS Status: 200, Size: 5
+00> Confirmed data size: 5
+00> Reading response data, size: 5
+00> Boutta READ packet n=1
+00> >>> AT+SHREAD=0,5
+00> <<< OK
+00> <<< +SHREAD: 5
+00> <<< NOCMD
+00> Command data captured: NOCMD
+00> Received command: NOCMD
+00> Processing command: NOCMD
+00> No commands waiting
+00> >>> AT+SHREQ="/api/ack/device001/OK",1
+00> <<< OK
+00> <<< +SHREQ: "GET",200,2
+00> HTTPS Status: 200, Size: 2
+00> Polling for commands...
+00> >>> AT+SHCHEAD
+00> <<< OK
+00> >>> AT+SHCPARA
+00> <<< OK
+00> >>> AT+SHAHEAD="User-Agent","nRF52-IoT-Controller"
+00> <<< OK
+00> >>> AT+SHAHEAD="Accept","/
+00> <<< OK
+00> >>> AT+SHAHEAD="Cache-control","no-cache"
+00> <<< OK
+00> >>> AT+SHAHEAD="Connection","keep-alive"
+00> <<< OK
+00> >>> AT+SHREQ="/api/poll/device001",1
+00> <<< OK
+00> Waiting for +SHREQ response...
+00> <<< +SHREQ: "GET",200,25
+00> HTTPS Status: 200, Size: 25
+00> Confirmed data size: 25
+00> Reading response data, size: 25
+00> Boutta READ packet n=2
+00> >>> AT+SHREAD=0,25
+00> <<< OK
+00> <<< +SHREAD: 25
+00> <<< CMD:BOOT,PIN:11,DATA:none
+00> Command data captured: CMD:BOOT,PIN:11,DATA:none
+00> Received command: CMD:BOOT,PIN:11,DATA:none
+00> Processing command: CMD:BOOT,PIN:11,DATA:none
+00> Parsed - CMD: BOOT, PIN: 11, DATA: none
+00> Executing: BOOT on pin 11
+00> Triggering SBC boot sequence...
+00> Boot trigger complete + SBC-active state entered
+00> >>> AT+SHREQ="/api/ack/device001/OK",1
+00> <<< OK
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+00> SBC active - MCU waiting/idle
+also, sometimes:
+00> *** Booting nRF Connect SDK v3.1.0-6c6e5b32496e 
+00> *** Using Zephyr OS v4.1.99-1612683d4010 
+00> IoT Controller Starting...
+00> Button configured with interrupt
+00> SBC handoff pin configured with falling-edge interrupt
+00> Starting polling thread...
+00> SBC powered down >>> handoff signal low
+00> Ending PPP session...
+00> [00:00:32.186,889] <err> os: ***** MPU FAULT *****
+00> [00:00:32.186,920] <err> os:   Data Access Violation
+00> 
+00> [00:00:32.186,920] <err> os:   MMFAR Address: 0x0
+00> [00:00:32.186,950] <err> os: r0/a1:  0x20000ba0  r1/a2:  0x00000000  r2/a3:  0x00000000
+00> [00:00:32.186,950] <err> os: r3/a4:  0x20000d08 r12/ip:  0x00000000 r14/lr:  0x00006211
+00> [00:00:32.186,950] <err> os:  xpsr:  0x01000221
+00> [00:00:32.186,981] <err> os: Faulting instruction address (r15/pc): 0x0000604e
+00> [00:00:32.187,011] <err> os: >>> ZEPHYR FATAL ERROR 19: Unknown error on CPU 0
+00> [00:00:32.187,011] <err> os: Fault during interrupt handling
+00> 
+00> [00:00:32.187,072] <err> os: Current thread: 0x20000b88 (unknown)
+00> [00:00:32.480,834] <err> os: Halting system
 */
