@@ -1,6 +1,6 @@
 /*
 
-v1.0-081025
+v1.1-201025
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -12,6 +12,8 @@ HTTPS POLLING SIM7080-NRF52832DK
      *Initial setup can be sped up
      *Debug prints & delays can be removed &or reduced
      *Cert doesn't have to be sent everytime (could be in main / everytime the modem boots, perhaps implement w/ PWRKEY pin logic)
+
+     v1.1-201025 - added SBC modem handoff to MCU x PSM&eDRX states x updated dts [psm/edrx unused, not implemented in backend yet]
 
     .dts added below (bottom) as git doesn't track it
 */
@@ -34,6 +36,8 @@ static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios)
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios); //oboard LED1
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios); //oboard LED2
 static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); //P0.11 to SBC (defined in dts)
+
+static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios); //MCU P0.28 << P32 SBC [handoff signal]
 
 
 static struct gpio_callback button_cb_data;
@@ -63,6 +67,8 @@ static int BAUD_RATE = 921600;
 static size_t resp_len = 0;
 static bool response_complete = false;
 static bool waiting_for_response = false;
+static bool is_cert_setup = false;
+static bool sbc_is_active = false;
 static int last_http_status_code = 0;
 static int last_http_data_size = 0;
 static int x = 0;
@@ -111,8 +117,30 @@ const char ca_cert[] =
 "vepuoxtGzi4CZ68zJpiq1UvSqTbFJjtbD4seiMHl\n"
 "-----END CERTIFICATE-----\n";
 
-
 const size_t ca_cert_len = sizeof(ca_cert) - 1;
+
+//efficiency states
+static bool psm_state = false;
+static bool edrx_state = false;
+
+static const char* edrx_seconds_to_code(uint32_t seconds) {
+    if (seconds <= 5) return "0000";
+    if (seconds <= 10) return "0001";
+    if (seconds <= 20) return "0010";
+    if (seconds <= 41) return "0011";
+    if (seconds <= 61) return "0100";
+    if (seconds <= 82) return "0101";
+    if (seconds <= 102) return "0110";
+    if (seconds <= 123) return "0111";
+    if (seconds <= 143) return "1000";
+    if (seconds <= 164) return "1001";
+    if (seconds <= 328) return "1010";
+    if (seconds <= 655) return "1011";
+    if (seconds <= 1311) return "1100";
+    if (seconds <= 2621) return "1101";
+    if (seconds <= 5243) return "1110";
+    return "1111";
+}
 
 bool download_and_convert_certificate(void) {
     /*
@@ -159,6 +187,8 @@ bool download_and_convert_certificate(void) {
         return false;
     }
 
+    is_cert_setup = true;
+
     return true;
 }
 
@@ -167,6 +197,131 @@ void button_pressed_cb(const struct device *dev, struct gpio_callback *cb, uint3
 {
     printk("Button pressed! Starting communication test...\n");
     start_networking = true;
+}
+
+static uint8_t encode_psm_timer(uint32_t seconds){
+    //PSM timer encoding according to 3GPP TS (T3324/T3412)
+    if (seconds == 0) return 0;
+    if (seconds <= 2) return seconds;
+    if (seconds <= 120) {
+        if (seconds % 6 == 0) return (seconds / 6) + 2;
+    }
+    if (seconds <= 1800) {
+        if (seconds % 60 == 0) return (seconds / 60) + 22;
+    }
+    if (seconds <= 10800) {
+        if (seconds % 360 == 0) return (seconds / 360) + 52;
+    }
+    if (seconds <= 31536000) {
+        if (seconds % 86400 == 0) return (seconds / 86400) + 82;
+    }
+    return 0;
+}
+
+bool psm_enable(uint32_t seconds_active, uint32_t seconds_periodic_tau) {
+    uint8_t t3324 = encode_psm_timer(seconds_active);
+    uint8_t t3412 = encode_psm_timer(seconds_periodic_tau);
+
+    if (t3324 == 0 || t3412 == 0) {
+        printk("PSM: Invalid timer values\n");
+        return false;
+    }
+
+    char cmd[64];
+    // Format: "00000101"..whatever (8-bit as binary string)
+    snprintf(cmd, sizeof(cmd), "AT+CPSMS=1,,,\"%08b\",\"%08b\"", t3412, t3324);
+
+    send_at_command(cmd);
+
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("Failed to enable PSM\n");
+        return false;
+    }
+
+    psm_state = true;
+    return true;
+}
+
+bool edrx_enable(uint32_t seconds_cycle) {
+    const char* edrx_code = edrx_seconds_to_code(seconds_cycle);
+    char cmd[40];
+
+    //4 for CAT-M
+    snprintf(cmd, sizeof(cmd), "AT+CEDRXS=1,4,\"%s\"", edrx_code);
+
+    send_at_command(cmd);
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("Failed to enable eDRX\n");
+        return false;
+    }
+
+    edrx_state = true;
+    return true;
+}
+
+bool psm_disable(void) {
+    send_at_command("AT+CPSMS=0");
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("Failed to disable PSM\n");
+        return false;
+    }
+    return true;
+}
+
+bool edrx_disable(void) {
+    send_at_command("AT+CEDRXS=0,4");
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("Failed to disable eDRX\n");
+        return false;
+    }
+    return true;
+}
+
+/*
+    usage:
+    psm_enable(30, 3600); - enable PSM w 30s active 1h TAU
+    edrx_enable(60); 60s cycle 
+
+*/
+
+
+bool end_ppp_session(void) {
+    printk("Ending PPP session...\n");
+
+    k_sleep(K_MSEC(1100)); // +100ms buffer to be safe (1 second minimum)
+    uart_poll_out(uart0, '+');
+    uart_poll_out(uart0, '+');
+    uart_poll_out(uart0, '+');
+    k_sleep(K_MSEC(1100));
+
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("FAILED TO STOP PPP\n");
+        return false;
+    }
+    printk("PPP escape successful\n");
+
+    send_at_command("ATH");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("Failed to hang up data call\n");
+        return false;
+    }
+
+    network_connected = true;
+    http_session_active = false;
+    return true;
+}
+
+static void sbc_handoff_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    printk("SBC powered down >>> handoff signal low\n");
+    if (end_ppp_session()) {
+        printk("Resuming MCU control...\n");
+        sbc_is_active = false;        // <-- Re-enable polling
+        is_cert_setup = true;            // cert already installed
+        if (!setup_https_session()) {
+            printk("HTTPS setup failed after SBC handoff!\n");
+        }
+    }
 }
 
 static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *user_data)
@@ -400,17 +555,26 @@ bool setup_https_session(void) {
     7s timeout for SHCONN seems to work ok, 10s+ safer
     */
 
+    if (http_session_active) {
+        printk("HTTPS session already active\n");
+        return true;
+    }
+
     printk("Setting up HTTPS session...\n");
     // Clean session
     cleanup_http_session();
 
-    send_at_command("AT+CSSLCFG=\"ignorertctime\",1,1");
-    k_sleep(K_MSEC(500));
-
     // Setup certificate
-    if (!download_and_convert_certificate()) {
-        printk("FATAL: Certificate setup failed. Cannot proceed securely.\n");
-        return false; 
+    if (!is_cert_setup) {
+        send_at_command("AT+CSSLCFG=\"ignorertctime\",1,1");
+        k_sleep(K_MSEC(500));
+        if (!download_and_convert_certificate()) {
+            printk("FATAL: Certificate setup failed.\n");
+            return false;
+        }
+        is_cert_setup = true;
+    } else {
+        printk("Certificate already installed, skipping cert download\n");
     }
 
     // Configure SSL - Using TLS 1.2
@@ -490,6 +654,11 @@ void cleanup_http_session(void) {
 }
 
 void poll_for_commands(void) {
+    if (sbc_is_active) {
+        printk("ERR: SBC ACTIVE - SKIP POLLING\n");
+        return;
+    }
+
     if (!http_session_active) {
         if (!setup_https_session()) {
             printk("Failed to setup HTTPS session\n");
@@ -499,7 +668,6 @@ void poll_for_commands(void) {
     
     printk("Polling for commands...\n");
     
-    // Clear headers and parameters
     send_at_command("AT+SHCHEAD");
     if (!wait_for_ok_error(K_SECONDS(2))) {
         printk("Clear headers failed\n");
@@ -583,6 +751,8 @@ void poll_for_commands(void) {
 
         printk("Boutta READ packet n=%d\n",x++);
         k_sleep(K_SECONDS(1)); // Give modem time to prepare data
+        x > 100000 ? x = 0 : (void)0;
+        x == 99999 ? printk("MEM: PACKET COUNT RESET\n") : (void)0;
         
         char read_cmd[32];
         snprintf(read_cmd, sizeof(read_cmd), "AT+SHREAD=0,%d", actual_data_size);
@@ -664,13 +834,16 @@ void execute_command(const char *cmd, int pin, const char *data) {
             printk("LED TOGGLED\n");
         }
     }
+
     else if (strcmp(cmd, "BOOT") == 0) { //changed from LO-HI-LO to HI-LO-HI as per SBC req (sbc default 3.3v pull none, active none)
         if (gpio_is_ready_dt(&trigger_pin)) {
             printk("Triggering SBC boot sequence...\n");
             gpio_pin_set_dt(&trigger_pin, 0);
             k_sleep(K_MSEC(250));
             gpio_pin_set_dt(&trigger_pin, 1);
-            printk("Boot trigger complete\n");
+            printk("Boot trigger complete + SBC-active state entered\n");
+
+            sbc_is_active = true;
         }
     }
     else if (strcmp(cmd, "PULSE") == 0) { //500ms
@@ -678,7 +851,9 @@ void execute_command(const char *cmd, int pin, const char *data) {
             gpio_pin_set_dt(&trigger_pin, 0);
             k_sleep(K_MSEC(500));
             gpio_pin_set_dt(&trigger_pin, 1);
-            printk("Pulsed pin %d\n", pin);
+            printk("Pulsed pin %d [SBC PIN]. SBC-active state entered \n", pin);
+
+            sbc_is_active = true;
         }
     }
     else if (strcmp(cmd, "BLINK") == 0) {
@@ -719,8 +894,14 @@ void polling_thread(void) {
     }
     
     while (1) {
-        poll_for_commands();
-        k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
+        if (!sbc_is_active){
+            poll_for_commands();
+            k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
+        }
+        else {
+            printk("SBC active - MCU waiting/idle\n");
+            k_sleep(K_SECONDS(5));
+        }
     }
 }
 
@@ -729,6 +910,7 @@ K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
 int main(void)
 {
     printk("IoT Controller Starting...\n");
+    static bool is_cert_state = false; //safeguard
 
     if (!device_is_ready(uart0)) {
         printk("UART not ready!\n");
@@ -779,6 +961,26 @@ int main(void)
         printk("Button configured with interrupt\n");
         gpio_pin_set_dt(&trigger_pin, 1);
     }
+
+    if (gpio_is_ready_dt(&sbc_handoff)) {
+        err = gpio_pin_configure_dt(&sbc_handoff, GPIO_INPUT);
+        if (err) {
+            printk("Failed to configure sbc_handoff: %d\n", err);
+        }
+
+        // Trigger on falling edge: SBC turning OFF
+        err = gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_TO_INACTIVE);
+        if (err) {
+            printk("Failed to configure sbc_handoff interrupt: %d\n", err);
+        }
+
+        static struct gpio_callback sbc_handoff_cb_data;
+        gpio_init_callback(&sbc_handoff_cb_data, sbc_handoff_cb, BIT(sbc_handoff.pin));
+        gpio_add_callback(sbc_handoff.port, &sbc_handoff_cb_data);
+
+        printk("SBC handoff pin configured with falling-edge interrupt\n");
+    }
+
 
     return 0;
 }
@@ -873,13 +1075,13 @@ chosen {
 
 	gpio_wake {
 		compatible = "gpio-keys";
-		wakeup-source;
 		wake_pin: wake_pin {
-			gpios = <&gpio0 28 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Wakeup Pin"; //sbc interrupting sbc for wake
+			gpios = <&gpio0 28 (GPIO_PULL_DOWN)>;
+			label = "SBC Handoff signal"; //handoff from sbc
 			zephyr,code = <INPUT_KEY_4>;
 		};
 	};
+
 
 ////////ARDUINO HEADER, ADC////////////
 
