@@ -1,6 +1,6 @@
 /*
 
-v1.1-201025
+v1.1-241025
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -14,6 +14,7 @@ HTTPS POLLING SIM7080-NRF52832DK
      *Cert doesn't have to be sent everytime (could be in main / everytime the modem boots, perhaps implement w/ PWRKEY pin logic)
 
      v1.1-201025 - added SBC modem handoff to MCU x PSM&eDRX states x updated dts [psm/edrx unused, not implemented in backend yet]
+     v1.1-241025a - additional handoff logic - tested working (no button logic yet) MCU-SBC-MCU handoff cycle OK via systemctl suspend/HTTPS wake
 
     .dts added below (bottom) as git doesn't track it
 */
@@ -142,6 +143,51 @@ static const char* edrx_seconds_to_code(uint32_t seconds) {
     return "1111";
 }
 
+bool end_ppp_session(void) {
+    printk("Ending PPP session...\n");
+
+    k_sleep(K_MSEC(1100)); // +100ms buffer to be safe (1 second minimum)
+    uart_poll_out(uart0, '+');
+    uart_poll_out(uart0, '+');
+    uart_poll_out(uart0, '+');
+    k_sleep(K_MSEC(1100));
+
+    if (!wait_for_ok_error(K_SECONDS(5))) {
+        printk("FAILED TO STOP PPP\n");
+        return false;
+    }
+    printk("PPP escape successful\n");
+
+    send_at_command("ATH");
+    if (!wait_for_ok_error(K_SECONDS(2))) {
+        printk("Failed to hang up data call\n");
+        return false;
+    }
+
+    network_connected = true;
+    http_session_active = false;
+    return true;
+}
+
+static void sbc_handoff_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    printk("sbc_handoff_work_handler: handling SBC handoff in thread context\n");
+
+    sbc_is_active = false;
+    if (end_ppp_session()) {
+        printk("Resuming MCU control (from work handler)...\n");
+        is_cert_setup = true;   
+
+        if (!setup_https_session()) {
+            printk("HTTPS setup failed after SBC handoff!\n");
+        }
+    } else {
+        printk("end_ppp_session() FAILED in work handler\n");
+        sbc_is_active = false;
+    }
+}
+
 bool download_and_convert_certificate(void) {
     /*
     AT+CFSINIT - Get flash data buffer (initialize)
@@ -201,7 +247,6 @@ void button_pressed_cb(const struct device *dev, struct gpio_callback *cb, uint3
 
 static uint8_t encode_psm_timer(uint32_t seconds){
     //PSM timer encoding according to 3GPP TS (T3324/T3412)
-    if (seconds == 0) return 0;
     if (seconds <= 2) return seconds;
     if (seconds <= 120) {
         if (seconds % 6 == 0) return (seconds / 6) + 2;
@@ -287,43 +332,15 @@ bool edrx_disable(void) {
 */
 
 
-bool end_ppp_session(void) {
-    printk("Ending PPP session...\n");
-
-    k_sleep(K_MSEC(1100)); // +100ms buffer to be safe (1 second minimum)
-    uart_poll_out(uart0, '+');
-    uart_poll_out(uart0, '+');
-    uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(1100));
-
-    if (!wait_for_ok_error(K_SECONDS(5))) {
-        printk("FAILED TO STOP PPP\n");
-        return false;
-    }
-    printk("PPP escape successful\n");
-
-    send_at_command("ATH");
-    if (!wait_for_ok_error(K_SECONDS(2))) {
-        printk("Failed to hang up data call\n");
-        return false;
-    }
-
-    network_connected = true;
-    http_session_active = false;
-    return true;
-}
-
 static void sbc_handoff_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    printk("SBC powered down >>> handoff signal low\n");
-    if (end_ppp_session()) {
-        printk("Resuming MCU control...\n");
-        sbc_is_active = false;        // <-- Re-enable polling
-        is_cert_setup = true;            // cert already installed
-        if (!setup_https_session()) {
-            printk("HTTPS setup failed after SBC handoff!\n");
-        }
-    }
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
+    ARG_UNUSED(pins);
+
+    /* quick log and schedule work; do NOT call blocking apis here */
+    printk("SBC handoff IRQ -> scheduling sbc_handoff_work\n");
+    k_work_submit(&sbc_handoff_work);
 }
 
 static void uart_evt_cb(const struct device *dev, struct uart_event *evt, void *user_data)
@@ -913,6 +930,7 @@ int main(void)
 {
     printk("IoT Controller Starting...\n");
     static bool is_cert_state = false; //safeguard
+    k_work_init(&sbc_handoff_work, sbc_handoff_work_handler);
 
     if (!device_is_ready(uart0)) {
         printk("UART not ready!\n");
