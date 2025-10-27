@@ -1,6 +1,6 @@
 /*
 
-v1.1-241025a-R
+v1.1-241025a-R2
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -15,8 +15,15 @@ HTTPS POLLING SIM7080-NRF52832DK
 
      v1.1-201025 - added SBC modem handoff to MCU x PSM&eDRX states x updated dts [psm/edrx unused, not implemented in backend yet]
      v1.1-241025a - additional handoff logic - tested working (no button logic yet) MCU-SBC-MCU handoff cycle OK via systemctl suspend/HTTPS wake
-        241025a-R - refactoring (starting w stable 241025a version not 241025b)
+        241025a-R - refactoring (starting w stable 241025a version not 241025b); R2 - fixed + tested
+        
     .dts added below (bottom) as git doesn't track it
+
+*/
+
+/*
+
+
 */
 
 
@@ -362,7 +369,7 @@ bool wait_for_response_with_timeout(const char *expected, k_timeout_t timeout)
 
 static bool clear_http_headers(void)
 {
-    return wait_for_ok_error(K_SECONDS(2)) && send_at_and_wait_ok("AT+SHCHEAD", K_SECONDS(2));
+    return send_at_and_wait_ok("AT+SHCHEAD", K_SECONDS(2));
 }
 
 static bool clear_http_parameters(void)
@@ -435,6 +442,19 @@ static bool send_at_and_wait_ok(const char *command, k_timeout_t timeout)
 
 bool setup_network(void)
 {
+
+    /*
+    AT+CMEE=2 - Enable verbose errors
+    AT - Init, ATE0 - echo off
+    AT+IPR - Set baud rate (sbc is 921600 since CATM1 7080 upload is up to 1Mbps)
+    AT+GMR - Request TA revision identification of software release
+    AT+CPIN? - OK if PSWD required (NOT) else WRITE (in our case it's fine)
+    AT+CGREG=1 - Enable network registration unsolicitated result code
+    AT+CGREG? - Check registration status (1,1 or 1,5 = registered)
+    AT+CGDCONT=1,"IP","internet.telia.ee" - Define PDP context (APN)
+    AT+CNACT=0,1 - Activate PDP context (APP Network Active)
+    */
+
     printk("Setting up network...\n");
     
     if (!send_at_and_wait_ok("AT+CMEE=2", K_SECONDS(2))) return false;
@@ -445,9 +465,10 @@ bool setup_network(void)
     snprintf(ipr_command, sizeof(ipr_command), "AT+IPR=%d", BAUD_RATE);
     if (!send_at_and_wait_ok(ipr_command, K_SECONDS(2))) return false;
 
-    send_at_command("AT+GMR");
-    k_sleep(K_SECONDS(2));
+    if (!send_at_and_wait_ok("AT+GMR", K_SECONDS(2))) return false;
+    k_sleep(K_SECONDS(1));
 
+    send_at_command("AT+CPIN?");
     if (!wait_for_response_with_timeout("READY", K_SECONDS(2))) return false;
     
     if (!send_at_and_wait_ok("AT+CGREG=1", K_SECONDS(2))) return false;
@@ -477,11 +498,9 @@ bool setup_network(void)
         if (!wait_for_response_with_timeout("+CNACT: 0,1", K_SECONDS(2))) {
             return false;
         }
+        k_sleep(K_SECONDS(2));
     }
-
-    if (!wait_for_response_with_timeout("+CNACT: 0,1", K_SECONDS(2))) {
-        return false;
-    }
+    k_sleep(K_SECONDS(1));
     
     http_state.is_connected = true;
     printk("Network setup complete\n");
@@ -522,6 +541,21 @@ bool download_and_convert_certificate(void)
 
 bool setup_https_session(void)
 {
+    /*
+    CSSLCFG: Configure SSL params of a context identifier
+    AT+CSSLCFG="ignorertctime",1,1 - Ignore RTC time check (1=ignore), could also set time/ignore this (time has been set to 2025 oct 1 as of v1.0-081025)
+    AT+CSSLCFG="sslversion",1,3 - Set SSL version to TLS 1.2 (3)
+    AT+CSSLCFG="sni",1,"seven080-mcu-backend.onrender.com" - Set SNI
+    AT+SHSSL=1,"server_ca.cer" - Use the certificate for verification
+    AT+SHCONF="URL","https://seven080-mcu-backend.onrender.com" - Set URL (HTTPS)
+    AT+SHCONF="BODYLEN",1024 - Set body length
+    AT+SHCONF="HEADERLEN",350 - Set header length
+    AT+CDNSGIP="seven080-mcu-backend.onrender.com" - Test DNS resolution
+    AT+SHCONN - Connect HTTPS session [main part, can take time]
+    AT+SHSTATE? - Check state (1=connected)
+    7s timeout for SHCONN seems to work ok, 10s+ safer
+    */
+
     if (http_state.is_session_active) {
         printk("HTTPS session already active\n");
         return true;
@@ -540,17 +574,18 @@ bool setup_https_session(void)
     }
 
     // SSL Configuration
-    if (!ssl_configure("ignorertctime", NULL)) return false;
+    send_at_command("AT+CSSLCFG=\"ignorertctime\",1,1");
+    if (!wait_for_ok_error(K_SECONDS(3))) return false;
     if (!ssl_configure("sslversion", "3")) return false; // TLS 1.2
     if (!ssl_configure("sni", SERVER_HOST)) return false;
 
-    char ssl_cmd[80];
-    snprintf(ssl_cmd, sizeof(ssl_cmd), "AT+SHSSL=1,\"%s\"", CA_CERT_FILE);
-    if (!send_at_and_wait_ok(ssl_cmd, K_SECONDS(3))) return false;
+    char ssl_command[80];
+    snprintf(ssl_command, sizeof(ssl_command), "AT+SHSSL=1,\"%s\"", CA_CERT_FILE);
+    if (!send_at_and_wait_ok(ssl_command, K_SECONDS(3))) return false;
 
-    char url_cmd[128];
-    snprintf(url_cmd, sizeof(url_cmd), "AT+SHCONF=\"URL\",\"https://%s\"", SERVER_URL);
-    if (!send_at_and_wait_ok(url_cmd, K_SECONDS(3))) return false;
+    char url_command[128];
+    snprintf(url_command, sizeof(url_command), "AT+SHCONF=\"URL\",\"https://%s\"", SERVER_URL);
+    if (!send_at_and_wait_ok(url_command, K_SECONDS(3))) return false;
 
     if (!send_at_and_wait_ok("AT+SHCONF=\"BODYLEN\",1024", K_SECONDS(3))) return false;
     if (!send_at_and_wait_ok("AT+SHCONF=\"HEADERLEN\",350", K_SECONDS(3))) return false;
@@ -604,6 +639,7 @@ void poll_for_commands(void)
     printk("Polling for commands...\n");
     
     if (!setup_default_headers()) {
+        printk("ERROR: Failed to setup HTTP headers\n");
         cleanup_http_session();
         return;
     }
@@ -644,9 +680,9 @@ void poll_for_commands(void)
             process_command(command_data);
             
             // Send acknowledgment
-            char ack_endpoint[100];
-            snprintf(ack_endpoint, sizeof(ack_endpoint), "/api/ack/%s/OK", DEVICE_ID);
-            http_get(ack_endpoint);
+            char acknowledgement_endpoint[100];
+            snprintf(acknowledgement_endpoint, sizeof(acknowledgement_endpoint), "/api/ack/%s/OK", DEVICE_ID);
+            http_get(acknowledgement_endpoint);
             wait_for_ok_error(K_SECONDS(7));
         } else {
             printk("No command data received within timeout\n");
@@ -736,6 +772,13 @@ void execute_command(const char *command, int pin, const char *data)
 
 // POWER MANAGEMENT ------------------------------------------------
 
+/* 
+    CURRENTLY UNUSED - EXAMPLE IMPLEMENTATION ONLY
+    usage:
+    psm_enable(30, 3600); - enable PSM w 30s active 1h TAU
+    edrx_enable(60); 60s cycle 
+*/
+
 static uint8_t encode_psm_timer(uint32_t seconds)
 {
     if (seconds <= 2) return seconds;
@@ -774,9 +817,9 @@ bool psm_enable(uint32_t seconds_active, uint32_t seconds_periodic_tau)
         printk("PSM: Invalid timer values\n");
         return false;
     }
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "AT+CPSMS=1,,,\"%08b\",\"%08b\"", t3412, t3324);
-    if (!send_at_and_wait_ok(cmd, K_SECONDS(5))) {
+    char command[64];
+    snprintf(command, sizeof(command), "AT+CPSMS=1,,,\"%08b\",\"%08b\"", t3412, t3324);
+    if (!send_at_and_wait_ok(command, K_SECONDS(5))) {
         printk("Failed to enable PSM\n");
         return false;
     }
@@ -797,9 +840,9 @@ bool psm_disable(void)
 bool edrx_enable(uint32_t seconds_cycle)
 {
     const char* edrx_code = edrx_seconds_to_code(seconds_cycle);
-    char cmd[40];
-    snprintf(cmd, sizeof(cmd), "AT+CEDRXS=1,4,\"%s\"", edrx_code);
-    if (!send_at_and_wait_ok(cmd, K_SECONDS(5))) {
+    char command[40];
+    snprintf(command, sizeof(command), "AT+CEDRXS=1,4,\"%s\"", edrx_code);
+    if (!send_at_and_wait_ok(command, K_SECONDS(5))) {
         printk("Failed to enable eDRX\n");
         return false;
     }
