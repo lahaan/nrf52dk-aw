@@ -1,6 +1,6 @@
 /*
 
-v1.1-241025a-R2
+v1.1-271025
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -15,14 +15,13 @@ HTTPS POLLING SIM7080-NRF52832DK
 
      v1.1-201025 - added SBC modem handoff to MCU x PSM&eDRX states x updated dts [psm/edrx unused, not implemented in backend yet]
      v1.1-241025a - additional handoff logic - tested working (no button logic yet) MCU-SBC-MCU handoff cycle OK via systemctl suspend/HTTPS wake
+     v1.1-241025b - handoff that "works" MCU-SBC-MCU handoff (60-90% reliable suspend/HTTPS wake) + button handoff (50-80% reliable) idek
+            Note: sometimes dies, sometimes modem starts speaking chinese (nihao!)
         241025a-R - refactoring (starting w stable 241025a version not 241025b); R2 - fixed + tested
-        
+     v1.1-271025 - Merged 241025a-R2 & 241025b - Works reliably. Tested.
+            Note: when SBC is active for a while, and MCU takes back control, MCU/Modem run into @cloudflare issue, mistakenly think HTTPS conn successful
+    todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
     .dts added below (bottom) as git doesn't track it
-
-*/
-
-/*
-
 
 */
 
@@ -85,6 +84,11 @@ typedef struct {
     size_t response_length;
 } uart_state_t;
 
+
+// SBC HANDOFF ENHANCEMENTS
+static volatile bool sbc_handoff_in_progress = false;
+static char pending_ack_cmd[128];
+static bool pending_ack = false;
 
 // GLOBAL STATE
 static http_state_t http_state = {0};
@@ -318,6 +322,10 @@ static void uart_event_callback(const struct device *dev, struct uart_event *eve
 
 void send_at_command(const char *command)
 {
+    if (is_sbc_active && !sbc_handoff_in_progress) {
+        printk("SKIP AT CMD (SBC active): %s\n", command);
+        return;
+    }
     printk(">>> %s\n", command);
     for (int i = 0; command[i] != '\0'; i++) {
         uart_poll_out(uart0, command[i]);
@@ -613,12 +621,28 @@ bool setup_https_session(void)
 
 void cleanup_http_session(void)
 {
+    if (is_sbc_active && !sbc_handoff_in_progress) {
+        printk("cleanup_http_session: SBC active - skipping AT, marking inactive\n");
+        http_state.is_session_active = false;
+        return;
+    }
+
+    // Full HTTP/SSL teardown
     if (http_state.is_session_active) {
         printk("Cleaning up HTTPS session...\n");
-        send_at_command("AT+SHDISC");
+        send_at_command("AT+SHDISC");   // Disconnect
         wait_for_ok_error(K_SECONDS(5));
         http_state.is_session_active = false;
     }
+
+    send_at_command("AT+SHSSL=0");
+    wait_for_ok_error(K_SECONDS(2));
+    send_at_command("AT+SHTRDT");
+    wait_for_ok_error(K_SECONDS(2));
+    send_at_command("AT+SHCHEAD");
+    wait_for_ok_error(K_SECONDS(2));
+    send_at_command("AT+SHCPARA"); 
+    wait_for_ok_error(K_SECONDS(2));
 }
 
 
@@ -680,10 +704,18 @@ void poll_for_commands(void)
             process_command(command_data);
             
             // Send acknowledgment
-            char acknowledgement_endpoint[100];
-            snprintf(acknowledgement_endpoint, sizeof(acknowledgement_endpoint), "/api/ack/%s/OK", DEVICE_ID);
-            http_get(acknowledgement_endpoint);
-            wait_for_ok_error(K_SECONDS(7));
+            char ack_url[128];
+            snprintf(ack_url, sizeof(ack_url), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
+
+            if (is_sbc_active && !sbc_handoff_in_progress) {
+                strncpy(pending_ack_cmd, ack_url, sizeof(pending_ack_cmd) - 1);
+                pending_ack_cmd[sizeof(pending_ack_cmd) - 1] = '\0';
+                pending_ack = true;
+                printk("ACK queued until MCU regains modem control\n");
+            } else {
+                send_at_command(ack_url);
+                wait_for_ok_error(K_SECONDS(7));
+            }
         } else {
             printk("No command data received within timeout\n");
         }
@@ -863,6 +895,24 @@ bool edrx_disable(void)
 
 // PPP & SBC HANDOFF ------------------------------------------------
 
+bool wait_for_modem_ready(int attempts, k_timeout_t per_try_timeout)
+{
+    for (int i = 0; i < attempts; i++) {
+        if (is_sbc_active && !sbc_handoff_in_progress) {
+            printk("wait_for_modem_ready abort: SBC active\n");
+            return false;
+        }
+        send_at_command("AT");
+        if (wait_for_ok_error(per_try_timeout)) {
+            printk("Modem ready (AT -> OK)\n");
+            return true;
+        }
+        printk("Modem not ready yet (attempt %d/%d). Retrying...\n", i+1, attempts);
+        k_msleep(200 + (i * 100));
+    }
+    return false;
+}
+
 bool end_ppp_session(void)
 {
     printk("Ending PPP session...\n");
@@ -870,7 +920,7 @@ bool end_ppp_session(void)
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(1100));
+    k_sleep(K_MSEC(3000)); // <-- increased from 1100 to 3000 ms
 
     if (!wait_for_ok_error(K_SECONDS(5))) {
         printk("FAILED TO STOP PPP\n");
@@ -884,7 +934,7 @@ bool end_ppp_session(void)
         return false;
     }
 
-    http_state.is_connected = true;
+    http_state.is_connected = false;
     http_state.is_session_active = false;
     return true;
 }
@@ -892,19 +942,68 @@ bool end_ppp_session(void)
 static void sbc_handoff_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
-    printk("sbc_handoff_work_handler: handling SBC handoff in thread context\n");
+    k_msleep(100); // debounce
 
-    is_sbc_active = false;
-    if (end_ppp_session()) {
-        printk("Resuming MCU control (from work handler)...\n");
-        uart_state.is_certificate_setup = true;
-        if (!setup_https_session()) {
-            printk("HTTPS setup failed after SBC handoff!\n");
-        }
-    } else {
-        printk("end_ppp_session() FAILED in work handler\n");
-        is_sbc_active = false;
+    int val = gpio_pin_get_dt(&sbc_handoff);
+    printk("SBC handoff work handler (pin=%d)\n", val);
+
+    if (val) {
+        // SBC became active → relinquish
+        is_sbc_active = true;
+        sbc_handoff_in_progress = false;
+        printk("SBC ACTIVE → MCU cleans up\n");
+        cleanup_http_session();
+        return;
     }
+
+    // SBC handed off → MCU resumes
+    printk("SBC handed off → MCU resuming control\n");
+    sbc_handoff_in_progress = true;
+    is_sbc_active = false;
+
+    // Re-enable UART if needed (optional but safe)
+    uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
+
+    // Retry PPP termination up to 4 times
+    bool ended = false;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (end_ppp_session()) {
+            ended = true;
+            break;
+        }
+        printk("PPP end attempt %d failed, retrying...\n", attempt + 1);
+        k_msleep(300 + (attempt * 200));
+    }
+
+    if (!ended) {
+        printk("Warning: PPP end failed; proceeding anyway\n");
+    }
+
+    k_sleep(K_MSEC(500));
+
+    // Ensure modem is responsive
+    if (!wait_for_modem_ready(5, K_SECONDS(2))) {
+        printk("Modem not ready after handoff — aborting HTTPS setup\n");
+        sbc_handoff_in_progress = false;
+        return;
+    }
+
+    k_sleep(K_MSEC(500));
+
+    // Re-establish HTTPS
+    if (!setup_https_session()) {
+        printk("HTTPS setup failed after handoff\n");
+    }
+
+    // Send pending ACK if any
+    if (pending_ack && !is_sbc_active) {
+        printk("Sending pending ACK: %s\n", pending_ack_cmd);
+        send_at_command(pending_ack_cmd);
+        wait_for_ok_error(K_SECONDS(7));
+        pending_ack = false;
+    }
+
+    sbc_handoff_in_progress = false;
 }
 
 
@@ -991,7 +1090,7 @@ int main(void)
     // SBC handoff
     if (gpio_is_ready_dt(&sbc_handoff)) {
         gpio_pin_configure_dt(&sbc_handoff, GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_TO_INACTIVE);
+        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_BOTH);
         gpio_init_callback(&sbc_handoff_cb_data, sbc_handoff_callback, BIT(sbc_handoff.pin));
         gpio_add_callback(sbc_handoff.port, &sbc_handoff_cb_data);
         printk("SBC handoff pin configured with falling-edge interrupt\n");
