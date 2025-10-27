@@ -37,20 +37,28 @@ HTTPS POLLING SIM7080-NRF52832DK
 
 
 // UART CONFIGURATION
-#define BAUD_RATE           921600
-#define RX_BUF_SIZE         128
-#define RESPONSE_BUF_SIZE   1024
-#define RX_TIMEOUT_DELAY    500
+#define BAUD_RATE                   921600
+#define RX_BUF_SIZE                 128
+#define RESPONSE_BUF_SIZE           1024
+#define RX_TIMEOUT_DELAY            500
+
+// PWRKEY CONFIGURATION
+#define PWRKEY_HIGH_MS              1075
+#define PWRKEY_LOW_MS               1075
+#define MODEM_RESET_HOLD_MS         13000      
+#define MODEM_BOOT_HOLD_MS          1500        
+#define MODEM_BOOT_WAIT_MS          10000       
+#define MODEM_POST_RESET_DELAY_MS   5000 
 
 // SERVER CONFIGURATION
-#define SERVER_URL          "seven080-mcu-backend.onrender.com"
-#define SERVER_HOST         "seven080-mcu-backend.onrender.com"
-#define DEVICE_ID           "device001"
-#define POLL_INTERVAL_SEC   10
+#define SERVER_URL                  "seven080-mcu-backend.onrender.com"
+#define SERVER_HOST                 "seven080-mcu-backend.onrender.com"
+#define DEVICE_ID                   "device001"
+#define POLL_INTERVAL_SEC           10
 
 // CERT
-#define CA_CERT_FILE        "server_ca.cer"
-#define CA_CERT_SIZE        2048
+#define CA_CERT_FILE                "server_ca.cer"
+#define CA_CERT_SIZE                2048
 
 
 // DEVICE TREE REFERENCES (GPIO, UART) - pins etc
@@ -61,6 +69,8 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); // P0.11 to SBC
 static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios); // MCU P0.28 << P32 SBC
 
+// Power key pin (not used yet)
+static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
 
 // STATE STRUCTURES
 typedef struct {
@@ -84,6 +94,15 @@ typedef struct {
     size_t response_length;
 } uart_state_t;
 
+// logging
+typedef struct {
+    uint32_t boot_count;
+    uint32_t poll_success;
+    uint32_t poll_fail;
+    uint32_t handoff_count;
+    uint32_t resent_count;
+} device_stats_t;
+static device_stats_t stats = {0};
 
 // SBC HANDOFF ENHANCEMENTS
 static volatile bool sbc_handoff_in_progress = false;
@@ -892,6 +911,86 @@ bool edrx_disable(void)
     return true;
 }
 
+void modem_hard_reset(void){
+    if (!gpio_is_ready_dt(&pwrkey_pin)) {
+        printk("Modem reset pin not ready\n");
+        return;
+    }
+
+    printk("Performing modem hard reset...\n");
+    gpio_pin_set_dt(&pwrkey_pin, 1);
+    k_sleep(K_MSEC(PWRKEY_HIGH_MS)); //minimum 1000ms, +75ms to be safe (1-12s)
+    gpio_pin_set_dt(&pwrkey_pin, 0);
+    k_sleep(K_SECONDS(3)); // wait for modem to shutdown
+    gpio_pin_set_dt(&pwrkey_pin, 1);
+    k_sleep(K_MSEC(PWRKEY_HIGH_MS));
+    gpio_pin_set_dt(&pwrkey_pin, 0);
+    k_sleep(K_SECONDS(3)); // wait for modem to startup
+    stats.boot_count++;
+    printk("Modem reboot complete\n");
+}
+
+void pull_pwrkey_low(void){
+    if (!gpio_is_ready_dt(&pwrkey_pin)) {
+        printk("PWRKEY pin not ready\n");
+        return;
+    }
+    gpio_pin_set_dt(&pwrkey_pin, 0);
+    k_sleep(K_MSEC(PWRKEY_LOW_MS));
+    gpio_pin_set_dt(&pwrkey_pin, 1);
+    k_sleep(K_MSEC(5000));
+    printk("PWRKEY pulse complete\n");
+}
+
+
+void modem_full_reset(void) {
+    if (!gpio_is_ready_dt(&pwrkey_pin)) {
+        printk("Modem reset pin not ready\n");
+        return;
+    }
+
+    stats.boot_count++;
+    printk("Boot attempt #%u\n", stats.boot_count);
+
+    printk("Performing full modem reset...\n");
+    gpio_pin_set_dt(&pwrkey_pin, 1);
+    k_sleep(K_MSEC(13000));
+    gpio_pin_set_dt(&pwrkey_pin, 0);
+    k_sleep(K_SECONDS(5)); // allow modem to settle
+    send_at_command("AT");
+    if (wait_for_ok_error(K_SECONDS(5))) {
+        printk("Modem full reset complete and responsive\n");
+        return;
+    }
+
+    printk("ERROR: Modem NOT RESPONSIVE after FULL RESET, attempting boot sequence...\n");
+
+    gpio_pin_set_dt(&pwrkey_pin, 1);
+    k_sleep(K_MSEC(1500));
+    gpio_pin_set_dt(&pwrkey_pin, 0);
+    k_sleep(K_SECONDS(5));
+
+    send_at_command("AT");
+    if (wait_for_ok_error(K_SECONDS(5))) {
+        printk("Modem BOOT SUCCESS after fallback!\n");
+        return;
+    }
+
+    printk("Trying hard reset [REBOOT]\n");
+    modem_hard_reset();
+    send_at_command("AT");
+    if (wait_for_ok_error(K_SECONDS(5))) {
+        printk("Modem RECOVERED\n");
+    } else {
+        printk("CRITICAL FAILURE: Modem FAILED after all recovery attempts\n");
+    }
+
+    printk("LOG: boot_count=%u, poll_success=%u, poll_fail=%u, handoff_count=%u, resent_count=%u\n",
+           stats.boot_count, stats.poll_success, stats.poll_fail,
+           stats.handoff_count, stats.resent_count);
+}
+
+
 
 // PPP & SBC HANDOFF ------------------------------------------------
 
@@ -958,6 +1057,7 @@ static void sbc_handoff_work_handler(struct k_work *work)
 
     // SBC handed off → MCU resumes
     printk("SBC handed off → MCU resuming control\n");
+    stats.handoff_count++;
     sbc_handoff_in_progress = true;
     is_sbc_active = false;
 
@@ -983,9 +1083,12 @@ static void sbc_handoff_work_handler(struct k_work *work)
 
     // Ensure modem is responsive
     if (!wait_for_modem_ready(5, K_SECONDS(2))) {
-        printk("Modem not ready after handoff — aborting HTTPS setup\n");
-        sbc_handoff_in_progress = false;
-        return;
+        printk("Modem unresponsive – resetting via PWRKEY\n");
+        modem_hard_reset();
+        if (!wait_for_modem_ready(10, K_SECONDS(3))) {
+            printk("Modem still dead after reset\n");
+            return;
+        }
     }
 
     k_sleep(K_MSEC(500));
@@ -1043,6 +1146,7 @@ void polling_thread(void)
         if (!is_sbc_active) {
             poll_for_commands();
             k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
+            (http_state.last_status_code == 200) ? stats.poll_success++ : stats.poll_fail++;
         } else {
             printk("SBC active - MCU waiting/idle\n");
             k_sleep(K_SECONDS(5));
@@ -1095,6 +1199,14 @@ int main(void)
         gpio_add_callback(sbc_handoff.port, &sbc_handoff_cb_data);
         printk("SBC handoff pin configured with falling-edge interrupt\n");
     }
+
+    // Modem PWRKEY
+    if (gpio_is_ready_dt(&pwrkey_pin)){
+        gpio_pin_configure_dt(&pwrkey_pin, GPIO_OUTPUT_INACTIVE);
+        printk("PWRKEY pin configured\n");
+    }
+
+    printk("Boot #%u complete. Waiting for button press to start networking...\n", stats.boot_count++);
 
     return 0;
 }
