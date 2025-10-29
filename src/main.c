@@ -1,6 +1,6 @@
 /*
 
-v1.1-271025
+v1.1-291025
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -14,13 +14,19 @@ HTTPS POLLING SIM7080-NRF52832DK
      *Cert doesn't have to be sent everytime (could be in main / everytime the modem boots, perhaps implement w/ PWRKEY pin logic)
 
      v1.1-201025 - added SBC modem handoff to MCU x PSM&eDRX states x updated dts [psm/edrx unused, not implemented in backend yet]
-     v1.1-241025a - additional handoff logic - tested working (no button logic yet) MCU-SBC-MCU handoff cycle OK via systemctl suspend/HTTPS wake
+     **v1.1-241025a - additional handoff logic - tested working (no button logic yet) MCU-SBC-MCU handoff cycle OK via systemctl suspend/HTTPS wake
      v1.1-241025b - handoff that "works" MCU-SBC-MCU handoff (60-90% reliable suspend/HTTPS wake) + button handoff (50-80% reliable) idek
             Note: sometimes dies, sometimes modem starts speaking chinese (nihao!)
         241025a-R - refactoring (starting w stable 241025a version not 241025b); R2 - fixed + tested
-     v1.1-271025 - Merged 241025a-R2 & 241025b - Works reliably. Tested.
+     *v1.1-271025 - Merged 241025a-R2 & 241025b - Works reliably. Tested. [Demo-ready / PoC-ready]
             Note: when SBC is active for a while, and MCU takes back control, MCU/Modem run into @cloudflare issue, mistakenly think HTTPS conn successful
-    todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
+     v1.1-271025a - Added PWRKEY functionality, recovery, logging states
+     v1.1-291025 - Watchdog reset on nrf stuck state -- low power functionality for nrf
+     v1.2-xx merging 27-29 and stabilizing + testing
+     v1.3-xx implementing PSM/eDRX & testing
+    24- todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
+    **Superstable
+    *Stable
     .dts added below (bottom) as git doesn't track it
 
 */
@@ -32,6 +38,7 @@ HTTPS POLLING SIM7080-NRF52832DK
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/watchdog.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -60,6 +67,8 @@ HTTPS POLLING SIM7080-NRF52832DK
 #define CA_CERT_FILE                "server_ca.cer"
 #define CA_CERT_SIZE                2048
 
+// WATCHDOG CONFIGURATION
+#define WATCHDOG_TIMEOUT_MS         30000
 
 // DEVICE TREE REFERENCES (GPIO, UART) - pins etc
 const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0)); // P0.06=TX, P0.08=RX
@@ -71,6 +80,9 @@ static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin
 
 // Power key pin (not used yet)
 static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
+// Watchdog
+static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
+static int wdt_channel_id;
 
 // STATE STRUCTURES
 typedef struct {
@@ -167,8 +179,8 @@ static void parse_shstate_response(const char *line);
 static void capture_http_body_data(const char *line, size_t length);
 
 // AT COMMAND HELPERS
-void send_at_command(const char *cmd);
-static bool send_at_and_wait_ok(const char *cmd, k_timeout_t timeout);
+void send_at_command(const char *command);
+static bool send_at_and_wait_ok(const char *command, k_timeout_t timeout);
 
 // NETWORK
 bool setup_network(void);
@@ -193,25 +205,38 @@ bool edrx_disable(void);
 static uint8_t encode_psm_timer(uint32_t seconds);
 static const char* edrx_seconds_to_code(uint32_t seconds);
 
+// MODEM PWRKEY
+void modem_hard_reset(void);
+void pull_pwrkey_low(void);
+void pull_pwrkey_high(void);
+void modem_full_reset(void);
+
 // PPP
 bool end_ppp_session(void);
 
 // COMMAND PROCESSING
 void poll_for_commands(void);
 void process_command(const char *response);
-void execute_command(const char *cmd, int pin, const char *data);
+void execute_command(const char *command, int pin, const char *data);
 
 // WAIT FUNCTIONS
 bool wait_for_response_with_timeout(const char *expected, k_timeout_t timeout);
+bool wait_for_modem_ready(int attempts, k_timeout_t per_try_timeout);
 bool wait_for_ok_error(k_timeout_t timeout);
 
 // CALLBACKS
-static void button_pressed_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins);
+static void button_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_work_handler(struct k_work *work);
 
 // THREADS
 void polling_thread(void);
+
+// WATCHDOG
+
+static void watchdog_feed(void);
+static void watchdog_init(void);
+void handle_watchdog_recovery(void);
 
 
 // UART PARSING ---------------------------------------------------------------------
@@ -359,6 +384,7 @@ bool wait_for_ok_error(k_timeout_t timeout)
 
     int64_t start = k_uptime_get();
     while (!uart_state.is_response_complete && (k_uptime_get() - start) < timeout.ticks) {
+        watchdog_feed();
         k_msleep(50);
     }
 
@@ -482,8 +508,12 @@ bool setup_network(void)
     AT+CNACT=0,1 - Activate PDP context (APP Network Active)
     */
 
+    wdt_feed(wdt, wdt_channel_id);
     printk("Setting up network...\n");
-    
+    if (http_state.is_session_active){ //todo: CGREG CGYATT todo checks for epicness for safety of the planet and our humanity 
+        return true;
+    }
+
     if (!send_at_and_wait_ok("AT+CMEE=2", K_SECONDS(2))) return false;
     if (!send_at_and_wait_ok("AT", K_SECONDS(2))) return false;
     if (!send_at_and_wait_ok("ATE0", K_SECONDS(2))) return false;
@@ -669,6 +699,7 @@ void cleanup_http_session(void)
 
 void poll_for_commands(void)
 {
+    wdt_feed(wdt, wdt_channel_id);
     if (is_sbc_active) {
         printk("ERR: SBC ACTIVE - SKIP POLLING\n");
         return;
@@ -723,16 +754,16 @@ void poll_for_commands(void)
             process_command(command_data);
             
             // Send acknowledgment
-            char ack_url[128];
-            snprintf(ack_url, sizeof(ack_url), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
+            char acknowledgement_url[128];
+            snprintf(acknowledgement_url, sizeof(acknowledgement_url), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
 
             if (is_sbc_active && !sbc_handoff_in_progress) {
-                strncpy(pending_ack_cmd, ack_url, sizeof(pending_ack_cmd) - 1);
+                strncpy(pending_ack_cmd, acknowledgement_url, sizeof(pending_ack_cmd) - 1);
                 pending_ack_cmd[sizeof(pending_ack_cmd) - 1] = '\0';
                 pending_ack = true;
                 printk("ACK queued until MCU regains modem control\n");
             } else {
-                send_at_command(ack_url);
+                send_at_command(acknowledgement_url);
                 wait_for_ok_error(K_SECONDS(7));
             }
         } else {
@@ -939,7 +970,19 @@ void pull_pwrkey_low(void){
     k_sleep(K_MSEC(PWRKEY_LOW_MS));
     gpio_pin_set_dt(&pwrkey_pin, 1);
     k_sleep(K_MSEC(5000));
-    printk("PWRKEY pulse complete\n");
+    printk("PWRKEY PULSED LOW\n");
+}
+
+void pull_pwrkey_high(void){ //likely for boot
+    if (!gpio_is_ready_dt(&pwrkey_pin)) {
+        printk("PWRKEY pin not ready\n");
+        return;
+    }
+    gpio_pin_set_dt(&pwrkey_pin, 1);
+    k_sleep(K_MSEC(PWRKEY_HIGH_MS));
+    gpio_pin_set_dt(&pwrkey_pin, 0);
+    printk("PWRKEY PULSED HIGH\n");
+    stats.boot_count++;
 }
 
 
@@ -949,6 +992,7 @@ void modem_full_reset(void) {
         return;
     }
 
+    watchdog_feed();
     stats.boot_count++;
     printk("Boot attempt #%u\n", stats.boot_count);
 
@@ -965,6 +1009,7 @@ void modem_full_reset(void) {
 
     printk("ERROR: Modem NOT RESPONSIVE after FULL RESET, attempting boot sequence...\n");
 
+    watchdog_feed();
     gpio_pin_set_dt(&pwrkey_pin, 1);
     k_sleep(K_MSEC(1500));
     gpio_pin_set_dt(&pwrkey_pin, 0);
@@ -976,6 +1021,7 @@ void modem_full_reset(void) {
         return;
     }
 
+    watchdog_feed();
     printk("Trying hard reset [REBOOT]\n");
     modem_hard_reset();
     send_at_command("AT");
@@ -1014,6 +1060,7 @@ bool wait_for_modem_ready(int attempts, k_timeout_t per_try_timeout)
 
 bool end_ppp_session(void)
 {
+    wdt_feed(wdt, wdt_channel_id);
     printk("Ending PPP session...\n");
     k_sleep(K_MSEC(1100));
     uart_poll_out(uart0, '+');
@@ -1154,10 +1201,113 @@ void polling_thread(void)
     }
 }
 
+
+// WATCHDOG ------------------------------------------------
+
+static void watchdog_feed(void)
+{
+    if (wdt && device_is_ready(wdt)) {
+        wdt_feed(wdt, wdt_channel_id);
+    }
+}
+
+static void watchdog_init(void)
+{
+    if (!device_is_ready(wdt)) {
+        printk("Watchdog device not ready\n");
+        return;
+    }
+
+    struct wdt_timeout_cfg wdt_config = {
+        .window = {0, WATCHDOG_TIMEOUT_MS}, 
+        .callback = NULL
+    };
+
+    wdt_channel_id = wdt_install_timeout(wdt, &wdt_config);
+    if (wdt_channel_id < 0) {
+        printk("Failed to install watchdog timeout: %d\n", wdt_channel_id);
+        return;
+    }
+    
+    int error = wdt_setup(wdt, 0);
+    if (error < 0) {
+        printk("Failed to setup watchdog: %d\n", error);;
+    }
+    else {
+        printk("Watchdog started with timeout of 10 seconds\n");
+    }
+}
+
+void handle_watchdog_recovery(void)
+{
+    printk("INITIATING WDT RECOVERY\n");
+
+    if (wait_for_modem_ready(2, K_SECONDS(1))) {    // wait for modem to respond
+        http_state.is_session_active = false;
+        send_at_command("AT+SHSTATE?");     // check if HTTPS is plausible
+        
+        int64_t start = k_uptime_get();
+        while ((k_uptime_get() - start) < K_SECONDS(3).ticks) {
+            if (strstr(response_buffer, "+SHSTATE:") != NULL) {
+                break; 
+            }
+            k_msleep(50);
+            watchdog_feed();
+        }
+
+        if (http_state.is_session_active) {
+            printk("HTTPS session intact — resuming\n");
+            return true;
+        }
+        return false;
+    }
+
+    watchdog_feed();
+    printk("Modem unresponsive — trying PPP escape (+++)\n");
+    //sending +++ as modem might be in PPP mode (mode SBC uses), +++ cancels it and enables AT commands
+    k_sleep(K_MSEC(1100));
+    uart_poll_out(uart0, '+');
+    uart_poll_out(uart0, '+');
+    uart_poll_out(uart0, '+');
+    k_sleep(K_MSEC(1400));
+
+    if (wait_for_ok_error(K_MSEC(1000))) { //if +++ responds with OK it's most certainly back from PPP and will have certs
+        printk("PPP escape succeeded\n");
+        uart_state.is_certificate_setup = true;
+        return false;
+    }
+
+    // None work, modem likely powered off or hung
+
+    printk("PPP escape failed — toggling PWRKEY\n"); 
+    watchdog_feed();
+    pull_pwrkey_high();
+    if (send_at_and_wait_ok("AT", K_SECONDS(1))) {
+        printk("Modem RESPONSIVE after PWRKEY TOGGLE\n");
+        return false;
+    }
+    
+    watchdog_feed();
+    modem_hard_reset();
+    if (send_at_and_wait_ok("AT", K_SECONDS(3))) {
+        printk("Modem RESPONSIVE after HARD REBOOT\n");
+        return false;
+    }
+
+    printk("Modem STILL UNRESPONSIVE — performing FULL FACTORY RESET - WAITING 15 SECONDS - REBOOT NRF TO CANCEL\n");
+    watchdog_feed();
+    k_sleep(K_SECONDS(15));
+    modem_full_reset();
+
+    return false;
+}
+
 K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
 
 int main(void)
 {
+    watchdog_init();
+
     printk("IoT Controller Starting...\n");
     k_work_init(&sbc_handoff_work, sbc_handoff_work_handler);
 
@@ -1206,9 +1356,28 @@ int main(void)
         printk("PWRKEY pin configured\n");
     }
 
+    watchdog_feed();
+
+    uint32_t reason_for_boot = NRF_POWER->RESETREAS;
+    if (reason_for_boot & POWER_RESETREAS_DOG_Msk) {
+        printk("Watchdog reset detected\n");
+        bool recovery_ok = handle_watchdog_recovery(); //todo fix
+        NRF_POWER->RESETREAS = 0xFFFFFFFF;
+
+        if (recovery_ok) {
+            printk("WDT recovery successful, resuming operation\n");
+        }
+        else {
+            is_start_networking = true;
+            polling_thread();
+            return 0;
+        }
+    }
+
     printk("Boot #%u complete. Waiting for button press to start networking...\n", stats.boot_count++);
 
     return 0;
+
 }
 
 
