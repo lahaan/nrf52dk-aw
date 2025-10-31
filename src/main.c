@@ -1,6 +1,6 @@
 /*
 
-v1.1-291025
+v1.2-311025
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -22,7 +22,7 @@ HTTPS POLLING SIM7080-NRF52832DK
             Note: when SBC is active for a while, and MCU takes back control, MCU/Modem run into @cloudflare issue, mistakenly think HTTPS conn successful
      v1.1-271025a - Added PWRKEY functionality, recovery, logging states
      v1.1-291025 - Watchdog reset on nrf stuck state -- low power functionality for nrf
-     v1.2-xx merging 27-29 and stabilizing + testing
+     v1.2-311025 - WDT+PWRKEY+R+Logging+Restfunctionality - untested
      v1.3-xx implementing PSM/eDRX & testing
     24- todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
     **Superstable
@@ -209,7 +209,7 @@ static const char* edrx_seconds_to_code(uint32_t seconds);
 void modem_hard_reset(void);
 void pull_pwrkey_low(void);
 void pull_pwrkey_high(void);
-void modem_full_reset(void);
+int modem_full_reset(void);
 
 // PPP
 bool end_ppp_session(void);
@@ -233,10 +233,9 @@ static void sbc_handoff_work_handler(struct k_work *work);
 void polling_thread(void);
 
 // WATCHDOG
-
 static void watchdog_feed(void);
 static void watchdog_init(void);
-void handle_watchdog_recovery(void);
+int handle_watchdog_recovery(void);
 
 
 // UART PARSING ---------------------------------------------------------------------
@@ -508,10 +507,17 @@ bool setup_network(void)
     AT+CNACT=0,1 - Activate PDP context (APP Network Active)
     */
 
-    wdt_feed(wdt, wdt_channel_id);
+    watchdog_feed();
     printk("Setting up network...\n");
-    if (http_state.is_session_active){ //todo: CGREG CGYATT todo checks for epicness for safety of the planet and our humanity 
-        return true;
+    if (http_state.is_session_active){
+        send_at_command("AT+CGREG?");
+        if (wait_for_response_with_timeout("+CGREG:", K_SECONDS(2))) {
+            if (strstr(response_buffer, "+CGREG: 1,1") != NULL || strstr(response_buffer, "+CGREG: 1,5") != NULL) {
+                return true;
+            }
+        }
+        http_state.is_session_active = false;
+        http_state.is_connected = false;
     }
 
     if (!send_at_and_wait_ok("AT+CMEE=2", K_SECONDS(2))) return false;
@@ -699,7 +705,7 @@ void cleanup_http_session(void)
 
 void poll_for_commands(void)
 {
-    wdt_feed(wdt, wdt_channel_id);
+    watchdog_feed();
     if (is_sbc_active) {
         printk("ERR: SBC ACTIVE - SKIP POLLING\n");
         return;
@@ -986,10 +992,10 @@ void pull_pwrkey_high(void){ //likely for boot
 }
 
 
-void modem_full_reset(void) {
+int modem_full_reset(void) {
     if (!gpio_is_ready_dt(&pwrkey_pin)) {
         printk("Modem reset pin not ready\n");
-        return;
+        return 1;
     }
 
     watchdog_feed();
@@ -1004,7 +1010,7 @@ void modem_full_reset(void) {
     send_at_command("AT");
     if (wait_for_ok_error(K_SECONDS(5))) {
         printk("Modem full reset complete and responsive\n");
-        return;
+        return 0;
     }
 
     printk("ERROR: Modem NOT RESPONSIVE after FULL RESET, attempting boot sequence...\n");
@@ -1018,7 +1024,7 @@ void modem_full_reset(void) {
     send_at_command("AT");
     if (wait_for_ok_error(K_SECONDS(5))) {
         printk("Modem BOOT SUCCESS after fallback!\n");
-        return;
+        return 0;
     }
 
     watchdog_feed();
@@ -1027,6 +1033,7 @@ void modem_full_reset(void) {
     send_at_command("AT");
     if (wait_for_ok_error(K_SECONDS(5))) {
         printk("Modem RECOVERED\n");
+        return 0;
     } else {
         printk("CRITICAL FAILURE: Modem FAILED after all recovery attempts\n");
     }
@@ -1034,6 +1041,7 @@ void modem_full_reset(void) {
     printk("LOG: boot_count=%u, poll_success=%u, poll_fail=%u, handoff_count=%u, resent_count=%u\n",
            stats.boot_count, stats.poll_success, stats.poll_fail,
            stats.handoff_count, stats.resent_count);
+    return 1;
 }
 
 
@@ -1060,7 +1068,7 @@ bool wait_for_modem_ready(int attempts, k_timeout_t per_try_timeout)
 
 bool end_ppp_session(void)
 {
-    wdt_feed(wdt, wdt_channel_id);
+    watchdog_feed();
     printk("Ending PPP session...\n");
     k_sleep(K_MSEC(1100));
     uart_poll_out(uart0, '+');
@@ -1238,12 +1246,14 @@ static void watchdog_init(void)
     }
 }
 
-void handle_watchdog_recovery(void)
+int handle_watchdog_recovery(void)
 {
     printk("INITIATING WDT RECOVERY\n");
 
     if (wait_for_modem_ready(2, K_SECONDS(1))) {    // wait for modem to respond
         http_state.is_session_active = false;
+        memset(response_buffer, 0, sizeof(response_buffer)); //CAN REMOVE ! experimental 
+        uart_state.response_length = 0;                      //CAN REMOVE ! experimental 
         send_at_command("AT+SHSTATE?");     // check if HTTPS is plausible
         
         int64_t start = k_uptime_get();
@@ -1257,9 +1267,8 @@ void handle_watchdog_recovery(void)
 
         if (http_state.is_session_active) {
             printk("HTTPS session intact — resuming\n");
-            return true;
         }
-        return false;
+        return 0;
     }
 
     watchdog_feed();
@@ -1274,7 +1283,7 @@ void handle_watchdog_recovery(void)
     if (wait_for_ok_error(K_MSEC(1000))) { //if +++ responds with OK it's most certainly back from PPP and will have certs
         printk("PPP escape succeeded\n");
         uart_state.is_certificate_setup = true;
-        return false;
+        return 0;
     }
 
     // None work, modem likely powered off or hung
@@ -1284,22 +1293,20 @@ void handle_watchdog_recovery(void)
     pull_pwrkey_high();
     if (send_at_and_wait_ok("AT", K_SECONDS(1))) {
         printk("Modem RESPONSIVE after PWRKEY TOGGLE\n");
-        return false;
+        return 0;
     }
     
     watchdog_feed();
     modem_hard_reset();
     if (send_at_and_wait_ok("AT", K_SECONDS(3))) {
         printk("Modem RESPONSIVE after HARD REBOOT\n");
-        return false;
+        return 0;
     }
 
     printk("Modem STILL UNRESPONSIVE — performing FULL FACTORY RESET - WAITING 15 SECONDS - REBOOT NRF TO CANCEL\n");
     watchdog_feed();
     k_sleep(K_SECONDS(15));
-    modem_full_reset();
-
-    return false;
+    return modem_full_reset();
 }
 
 K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
@@ -1361,20 +1368,12 @@ int main(void)
     uint32_t reason_for_boot = NRF_POWER->RESETREAS;
     if (reason_for_boot & POWER_RESETREAS_DOG_Msk) {
         printk("Watchdog reset detected\n");
-        bool recovery_ok = handle_watchdog_recovery(); //todo fix
         NRF_POWER->RESETREAS = 0xFFFFFFFF;
-
-        if (recovery_ok) {
-            printk("WDT recovery successful, resuming operation\n");
-        }
-        else {
-            is_start_networking = true;
-            polling_thread();
-            return 0;
-        }
+        if (handle_watchdog_recovery() == 0) is_start_networking = true;
+        (is_start_networking = true) ? printk("[WDTR SUCCESS] - ") : printk("[WDTR ERROR] - ");
     }
 
-    printk("Boot #%u complete. Waiting for button press to start networking...\n", stats.boot_count++);
+    printk("Boot #%u complete. Waiting for button press to start networking... unless WDTR\n", stats.boot_count++);
 
     return 0;
 
