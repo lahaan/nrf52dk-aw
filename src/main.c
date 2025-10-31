@@ -73,6 +73,7 @@ HTTPS POLLING SIM7080-NRF52832DK
 // DEVICE TREE REFERENCES (GPIO, UART) - pins etc
 const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0)); // P0.06=TX, P0.08=RX
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios); //for pwrpin, state testing/debugging
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios); // onboard LED1
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios); // onboard LED2
 static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); // P0.11 to SBC
@@ -139,7 +140,9 @@ static bool is_command_received = false;
 
 // WORK QUEUE
 static struct k_work sbc_handoff_work;
+static struct k_work pwrkey_work;
 static struct gpio_callback button_callback_data;
+static struct gpio_callback button2_callback_data;
 static struct gpio_callback sbc_handoff_cb_data;
 
 // CERTIFICATE DATA
@@ -206,6 +209,7 @@ static uint8_t encode_psm_timer(uint32_t seconds);
 static const char* edrx_seconds_to_code(uint32_t seconds);
 
 // MODEM PWRKEY
+void pwrkey_work_handler(struct k_work *work);
 void modem_hard_reset(void);
 void pull_pwrkey_low(void);
 void pull_pwrkey_high(void);
@@ -226,6 +230,7 @@ bool wait_for_ok_error(k_timeout_t timeout);
 
 // CALLBACKS
 static void button_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
+static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_work_handler(struct k_work *work);
 
@@ -988,7 +993,12 @@ void pull_pwrkey_high(void){ //likely for boot
     k_sleep(K_MSEC(PWRKEY_HIGH_MS));
     gpio_pin_set_dt(&pwrkey_pin, 0);
     printk("PWRKEY PULSED HIGH\n");
-    stats.boot_count++;
+}
+
+
+void pwrkey_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    pull_pwrkey_high();
 }
 
 
@@ -1181,6 +1191,12 @@ static void sbc_handoff_callback(const struct device *dev, struct gpio_callback 
     k_work_submit(&sbc_handoff_work);
 }
 
+static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins){
+    ARG_UNUSED(dev); ARG_UNUSED(callback); ARG_UNUSED(pins);
+    printk("Button2 pressed! PWRKEY-TEST\n");
+    k_work_submit(&pwrkey_work);
+}
+
 
 // THREADS ------------------------------------------------
 
@@ -1227,7 +1243,9 @@ static void watchdog_init(void)
     }
 
     struct wdt_timeout_cfg wdt_config = {
-        .window = {0, WATCHDOG_TIMEOUT_MS}, 
+        .window.min = 0U,
+        .window.max = WATCHDOG_TIMEOUT_MS,
+        .flags = WDT_FLAG_RESET_SOC,
         .callback = NULL
     };
 
@@ -1239,11 +1257,11 @@ static void watchdog_init(void)
     
     int error = wdt_setup(wdt, 0);
     if (error < 0) {
-        printk("Failed to setup watchdog: %d\n", error);;
+        printk("Failed to setup watchdog: %d\n", error);
+        return;
     }
-    else {
-        printk("Watchdog started with timeout of 10 seconds\n");
-    }
+
+    printk("Watchdog started: [T: %dms]\n", WATCHDOG_TIMEOUT_MS);
 }
 
 int handle_watchdog_recovery(void)
@@ -1314,9 +1332,12 @@ K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
 int main(void)
 {
     watchdog_init();
+    uint32_t rr = NRF_POWER->RESETREAS;
+    if (rr & POWER_RESETREAS_DOG_Msk) printk("WDT RESET DETECTED");
 
     printk("IoT Controller Starting...\n");
     k_work_init(&sbc_handoff_work, sbc_handoff_work_handler);
+    k_work_init(&pwrkey_work, pwrkey_work_handler);
 
     if (!device_is_ready(uart0)) {
         printk("UART not ready!\n");
@@ -1348,6 +1369,14 @@ int main(void)
         printk("Button configured with interrupt\n");
     }
 
+    if (gpio_is_ready_dt(&button2)) {
+        gpio_pin_configure_dt(&button2, GPIO_INPUT | GPIO_PULL_UP);
+        gpio_pin_interrupt_configure_dt(&button2, GPIO_INT_EDGE_TO_ACTIVE);
+        gpio_init_callback(&button2_callback_data, button2_pressed_callback, BIT(button2.pin));
+        gpio_add_callback(button2.port, &button2_callback_data);
+        printk("Button2 configured with interrupt\n");
+    }
+
     // SBC handoff
     if (gpio_is_ready_dt(&sbc_handoff)) {
         gpio_pin_configure_dt(&sbc_handoff, GPIO_INPUT);
@@ -1370,7 +1399,9 @@ int main(void)
         printk("Watchdog reset detected\n");
         NRF_POWER->RESETREAS = 0xFFFFFFFF;
         if (handle_watchdog_recovery() == 0) is_start_networking = true;
-        (is_start_networking = true) ? printk("[WDTR SUCCESS] - ") : printk("[WDTR ERROR] - ");
+        (is_start_networking == true) ? printk("[WDTR SUCCESS] - ") : printk("[WDTR ERROR] - ");
+        
+
     }
 
     printk("Boot #%u complete. Waiting for button press to start networking... unless WDTR\n", stats.boot_count++);
