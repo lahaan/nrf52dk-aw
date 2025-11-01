@@ -992,6 +992,7 @@ void pull_pwrkey_high(void){ //likely for boot
     gpio_pin_set_dt(&pwrkey_pin, 1);
     k_sleep(K_MSEC(PWRKEY_HIGH_MS));
     gpio_pin_set_dt(&pwrkey_pin, 0);
+    k_sleep(K_MSEC(5000));
     printk("PWRKEY PULSED HIGH\n");
 }
 
@@ -1328,6 +1329,8 @@ int handle_watchdog_recovery(void)
 }
 
 K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
+
+//todo: wdt *does* work however when coming from reboot it doesn't detect that wdt caused the reboot/restart for some reason
 
 int main(void)
 {
