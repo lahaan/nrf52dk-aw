@@ -1,6 +1,6 @@
 /*
 
-v1.3-031125
+v1.2-031125a
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -24,6 +24,7 @@ HTTPS POLLING SIM7080-NRF52832DK
      v1.1-291025 - Watchdog reset on nrf stuck state -- low power functionality for nrf
      v1.2-311025 - WDT+PWRKEY+R+Logging+Restfunctionality - untested
      v1.2-031125 - tested wdt+pwrkey+logging, reliable but slow
+     v1.2-031125a - Optimizations + on-board debugger for enable/disable wdt added [untested]
      v1.3-xx implementing PSM/eDRX & testing
     24- todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
     **Superstable
@@ -75,8 +76,10 @@ HTTPS POLLING SIM7080-NRF52832DK
 const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0)); // P0.06=TX, P0.08=RX
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios); //for pwrpin, state testing/debugging
+static const struct gpio_dt_spec button3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios); // wdt customizer
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios); // onboard LED1
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios); // onboard LED2
+static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios); // onboard LED3, wdt
 static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); // P0.11 to SBC
 static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios); // MCU P0.28 << P32 SBC
 
@@ -142,8 +145,10 @@ static bool is_command_received = false;
 // WORK QUEUE
 static struct k_work sbc_handoff_work;
 static struct k_work pwrkey_work;
+static struct k_work wdt_config_work; 
 static struct gpio_callback button_callback_data;
 static struct gpio_callback button2_callback_data;
+static struct gpio_callback button3_callback_data;
 static struct gpio_callback sbc_handoff_cb_data;
 
 // CERTIFICATE DATA
@@ -232,8 +237,11 @@ bool wait_for_ok_error(k_timeout_t timeout);
 // CALLBACKS
 static void button_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
+static void button3_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_work_handler(struct k_work *work);
+static void wdt_config_work_handler(struct k_work *work);
+
 
 // THREADS
 void polling_thread(void);
@@ -243,6 +251,12 @@ static void watchdog_feed(void);
 static void watchdog_init(void);
 static bool is_in_recovery = false;
 int handle_watchdog_recovery(void);
+
+//debugging-tooling for wdt
+static void reconfigure_watchdog(uint32_t new_timeout);
+static uint32_t wdt_timeout_settings[] = {30000, 60000, 510000}; // 30s, 60s, 510s (512s theoretical max for 52832)
+static int current_wdt_setting = 0; // array index for wdt_timeout_settings
+static bool is_wdt_debug_mode = false;
 
 
 // UART PARSING ---------------------------------------------------------------------
@@ -393,7 +407,7 @@ bool wait_for_ok_error(k_timeout_t timeout)
         if (is_in_recovery){
             watchdog_feed();
         }
-        k_msleep(50);
+        k_msleep(is_in_recovery ? 7 : 50); //when in recovery from wdt, use 7ms for much speedier response
     }
 
     if (!uart_state.is_response_complete) {
@@ -1196,10 +1210,26 @@ static void sbc_handoff_callback(const struct device *dev, struct gpio_callback 
     k_work_submit(&sbc_handoff_work);
 }
 
-static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins){
+static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
+{
     ARG_UNUSED(dev); ARG_UNUSED(callback); ARG_UNUSED(pins);
     printk("Button2 pressed! PWRKEY-TEST\n");
     k_work_submit(&pwrkey_work);
+}
+
+static void button3_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
+{
+    ARG_UNUSED(dev); ARG_UNUSED(callback); ARG_UNUSED(pins);
+    
+    if (!is_wdt_debug_mode) {
+        is_wdt_debug_mode = true;
+        printk("WDT DEBUG MODE ENABLED\n");
+    } else {
+        current_wdt_setting = (current_wdt_setting + 1) % 3;
+        printk("WDT setting changed to index: %d\n", current_wdt_setting);
+    }
+    
+    k_work_submit(&wdt_config_work);
 }
 
 
@@ -1234,7 +1264,7 @@ void polling_thread(void)
 // WATCHDOG ------------------------------------------------
 
 static void watchdog_feed(void)
-{
+{   
     if (wdt && device_is_ready(wdt)) {
         wdt_feed(wdt, wdt_channel_id);
     }
@@ -1269,6 +1299,39 @@ static void watchdog_init(void)
     printk("Watchdog started: [T: %dms]\n", WATCHDOG_TIMEOUT_MS);
 }
 
+static void reconfigure_watchdog(uint32_t new_timeout)
+{
+    if (!device_is_ready(wdt)) {
+        printk("WDT device not ready for reconfig\n");
+        return;
+    }
+    
+    // Disable current WDT
+    wdt_disable(wdt);
+    
+    // Setup new config
+    struct wdt_timeout_cfg wdt_config = {
+        .window.min = 0U,
+        .window.max = new_timeout,
+        .flags = WDT_FLAG_RESET_SOC,
+        .callback = NULL
+    };
+    
+    wdt_channel_id = wdt_install_timeout(wdt, &wdt_config);
+    if (wdt_channel_id < 0) {
+        printk("WDT reconfig failed: %d\n", wdt_channel_id);
+        return;
+    }
+    
+    int error = wdt_setup(wdt, 0);
+    if (error < 0) {
+        printk("WDT setup failed: %d\n", error);
+        return;
+    }
+    
+    printk("WDT reconfigured: %dms timeout\n", new_timeout);
+}
+
 int handle_watchdog_recovery(void)
 {
     printk("INITIATING WDT RECOVERY\n");
@@ -1285,7 +1348,7 @@ int handle_watchdog_recovery(void)
             if (strstr(response_buffer, "+SHSTATE:") != NULL) {
                 break; 
             }
-            k_msleep(50);
+            k_msleep(20);
             watchdog_feed();
         }
 
@@ -1333,9 +1396,33 @@ int handle_watchdog_recovery(void)
     return modem_full_reset();
 }
 
+static void wdt_config_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    
+    if (!is_wdt_debug_mode) {
+        return;
+    }
+    
+    reconfigure_watchdog(wdt_timeout_settings[current_wdt_setting]);
+    
+    int blink_count = current_wdt_setting + 1;
+    for (int i = 0; i < blink_count; i++) {
+        gpio_pin_set_dt(&led1, 1);
+        k_msleep(200);
+        gpio_pin_set_dt(&led1, 0);
+        k_msleep(200);
+    }
+    
+    printk("WDT setting: %s\n", 
+        current_wdt_setting == 0 ? "DEFAULT (30s)" :
+        current_wdt_setting == 1 ? "MEDIUM (60s)" : "MAX (510s)");
+}
+
+
+
 K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
 
-//todo: wdt *does* work however when coming from reboot it doesn't detect that wdt caused the reboot/restart for some reason
 
 int main(void)
 {
@@ -1346,6 +1433,7 @@ int main(void)
     printk("IoT Controller Starting...\n");
     k_work_init(&sbc_handoff_work, sbc_handoff_work_handler);
     k_work_init(&pwrkey_work, pwrkey_work_handler);
+    k_work_init(&wdt_config_work, wdt_config_work_handler);
 
     if (!device_is_ready(uart0)) {
         printk("UART not ready!\n");
@@ -1361,6 +1449,7 @@ int main(void)
     // Configure LEDs
     if (gpio_is_ready_dt(&led0)) gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
     if (gpio_is_ready_dt(&led1)) gpio_pin_configure_dt(&led1, GPIO_OUTPUT_INACTIVE);
+    if (gpio_is_ready_dt(&led2)) gpio_pin_configure_dt(&led2, GPIO_OUTPUT_INACTIVE);
 
     // Configure trigger pin
     if (gpio_is_ready_dt(&trigger_pin)) {
@@ -1383,6 +1472,14 @@ int main(void)
         gpio_init_callback(&button2_callback_data, button2_pressed_callback, BIT(button2.pin));
         gpio_add_callback(button2.port, &button2_callback_data);
         printk("Button2 configured with interrupt\n");
+    }
+
+    if (gpio_is_ready_dt(&button3)) {
+        gpio_pin_configure_dt(&button3, GPIO_INPUT | GPIO_PULL_UP);
+        gpio_pin_interrupt_configure_dt(&button3, GPIO_INT_EDGE_TO_ACTIVE);
+        gpio_init_callback(&button3_callback_data, button3_pressed_callback, BIT(button3.pin));
+        gpio_add_callback(button3.port, &button3_callback_data);
+        printk("Debug button (SW3) configured\n");
     }
 
     // SBC handoff
