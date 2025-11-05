@@ -41,6 +41,7 @@ HTTPS POLLING SIM7080-NRF52832DK
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/watchdog.h>
+#include <zephyr/drivers/gpio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -83,8 +84,8 @@ static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); // P0.11 to SBC
 static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios); // MCU P0.28 << P32 SBC
 
-// Power key pin (not used yet)
-static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
+// Power key pin
+static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0}); // P0.12 to PWRKEY (Modem)
 // Watchdog
 static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 static int wdt_channel_id;
@@ -237,8 +238,6 @@ static void button_pressed_callback(const struct device *dev, struct gpio_callba
 static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_work_handler(struct k_work *work);
-static void wdt_config_work_handler(struct k_work *work);
-
 
 // THREADS
 void polling_thread(void);
@@ -1124,23 +1123,36 @@ static void sbc_handoff_work_handler(struct k_work *work)
     int val = gpio_pin_get_dt(&sbc_handoff);
     printk("SBC handoff work handler (pin=%d)\n", val);
 
-    if (val) {
+    if (val == 1) {
         // SBC became active → relinquish
         is_sbc_active = true;
         sbc_handoff_in_progress = false;
         printk("SBC ACTIVE → MCU cleans up\n");
         cleanup_http_session();
+        
+        if (device_is_ready(uart0) && !pm_device_is_busy(uart0)){
+            uart_tx_abort(uart0);
+            pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
+            printk("UART SUSPENDED\n");
+        }
+        watchdog_feed();
+        k_sleep(K_FOREVER);
         return;
     }
+    else{
+        printk("SBC handed off → MCU resuming control\n");
+        stats.handoff_count++;
+        sbc_handoff_in_progress = true;
+        is_sbc_active = false;
+        if (device_is_ready(uart0)){
+            pm_device_action_run(uart0, PM_DEVICE_ACTION_RESUME);
+            uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
+            printk("UART RESUME\n");
+        }
+    }
+    sbc_handoff_in_progress = false;
+    is_start_networking = true;
 
-    // SBC handed off → MCU resumes
-    printk("SBC handed off → MCU resuming control\n");
-    stats.handoff_count++;
-    sbc_handoff_in_progress = true;
-    is_sbc_active = false;
-
-    // Re-enable UART if needed (optional but safe)
-    uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
 
     // Retry PPP termination up to 4 times
     bool ended = false;
@@ -1233,6 +1245,7 @@ void polling_thread(void)
             k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
             (http_state.last_status_code == 200) ? stats.poll_success++ : stats.poll_fail++;
         } else {
+            watchdog_feed();
             printk("SBC active - MCU waiting/idle\n");
             k_sleep(K_SECONDS(5));
         }
@@ -1414,7 +1427,7 @@ int main(void)
     // SBC handoff
     if (gpio_is_ready_dt(&sbc_handoff)) {
         gpio_pin_configure_dt(&sbc_handoff, GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_BOTH);
+        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_BOTH | GPIO_INT_WAKEUP);
         gpio_init_callback(&sbc_handoff_cb_data, sbc_handoff_callback, BIT(sbc_handoff.pin));
         gpio_add_callback(sbc_handoff.port, &sbc_handoff_cb_data);
         printk("SBC handoff pin configured with falling-edge interrupt\n");
