@@ -1,6 +1,7 @@
 /*
 
-v1.2 051125-LPE-b
+v1.2-041125a [CLOUDFLARE DoS PROTECTION NOT MITIGATED]
+    -cloudfare DoS issue mentioned at ln1300
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -25,6 +26,7 @@ HTTPS POLLING SIM7080-NRF52832DK
      v1.2-311025 - WDT+PWRKEY+R+Logging+Restfunctionality - untested
      v1.2-031125 - tested wdt+pwrkey+logging, reliable but slow
      v1.2-031125a - Optimizations + on-board debugger for enable/disable wdt added [untested] - redacted, 04 replaced w other logic
+     *v1.2-041125a - Majorly working version. [gets blocked by cloudflare & wdt doesnt account for this]
      v1.3-xx implementing PSM/eDRX & testing
     24- todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
     **Superstable
@@ -38,7 +40,6 @@ HTTPS POLLING SIM7080-NRF52832DK
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
-#include <zephyr/pm/device.h> //????
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/watchdog.h>
@@ -84,8 +85,8 @@ static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); // P0.11 to SBC
 static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios); // MCU P0.28 << P32 SBC
 
-// Power key pin
-static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0}); // P0.12 to PWRKEY (Modem)
+// Power key pin (not used yet)
+static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
 // Watchdog
 static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 static int wdt_channel_id;
@@ -238,6 +239,8 @@ static void button_pressed_callback(const struct device *dev, struct gpio_callba
 static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_work_handler(struct k_work *work);
+static void wdt_config_work_handler(struct k_work *work);
+
 
 // THREADS
 void polling_thread(void);
@@ -1098,7 +1101,7 @@ bool end_ppp_session(void)
     uart_poll_out(uart0, '+');
     k_sleep(K_MSEC(3000)); // <-- increased from 1100 to 3000 ms
 
-    if (!wait_for_ok_error(K_SECONDS(3))) {
+    if (!wait_for_ok_error(K_SECONDS(5))) {
         printk("FAILED TO STOP PPP\n");
         return false;
     }
@@ -1123,34 +1126,23 @@ static void sbc_handoff_work_handler(struct k_work *work)
     int val = gpio_pin_get_dt(&sbc_handoff);
     printk("SBC handoff work handler (pin=%d)\n", val);
 
-    if (val == 1) {
-        // SBC became active → relinquish control
+    if (val) {
+        // SBC became active → relinquish
         is_sbc_active = true;
         sbc_handoff_in_progress = false;
         printk("SBC ACTIVE → MCU cleans up\n");
         cleanup_http_session();
-        
-        if (device_is_ready(uart0) && !pm_device_is_busy(uart0)) {
-            uart_tx_abort(uart0);
-            pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
-            printk("UART SUSPENDED\n");
-        }
-        watchdog_feed();
-        // No k_sleep here—let polling thread sleep to avoid blocking workqueue
         return;
-    } else {
-        printk("SBC handed off → MCU resuming control\n");
-        stats.handoff_count++;
-        sbc_handoff_in_progress = true;
-        is_sbc_active = false;
-        if (device_is_ready(uart0)) {
-            pm_device_action_run(uart0, PM_DEVICE_ACTION_RESUME);
-            uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
-            printk("UART RESUME\n");
-        }
     }
-    sbc_handoff_in_progress = false;
-    is_start_networking = true;
+
+    // SBC handed off → MCU resumes
+    printk("SBC handed off → MCU resuming control\n");
+    stats.handoff_count++;
+    sbc_handoff_in_progress = true;
+    is_sbc_active = false;
+
+    // Re-enable UART if needed (optional but safe)
+    uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
 
     // Retry PPP termination up to 4 times
     bool ended = false;
@@ -1210,8 +1202,7 @@ static void button_pressed_callback(const struct device *dev, struct gpio_callba
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
 {
     ARG_UNUSED(dev); ARG_UNUSED(callback); ARG_UNUSED(pins);
-    int current_val = gpio_pin_get_dt(&sbc_handoff);  // Read live state
-    printk("SBC handoff IRQ triggered! Pins: 0x%08x, Current pin state: %d\n", pins, current_val);
+    printk("SBC handoff IRQ -> scheduling sbc_handoff_work\n");
     k_work_submit(&sbc_handoff_work);
 }
 
@@ -1244,17 +1235,9 @@ void polling_thread(void)
             k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
             (http_state.last_status_code == 200) ? stats.poll_success++ : stats.poll_fail++;
         } else {
-            static bool first_wait = true;
-            if (first_wait) {
-                printk("SBC Active - low power wait (wake on handoff IRQ)");
-                first_wait = false;
-            }
-            // SBC active: Low-power loop with WDT feed (wakes only on IRQ)
-            while (is_sbc_active) {
-                watchdog_feed();  // Feed every iteration
-                k_sleep(K_SECONDS(20));  // Sleep 20s; IRQ can wake mid-sleep
-            }
-            first_wait = true;            // Exits loop on handoff (is_sbc_active=false from work handler)
+            watchdog_feed();
+            printk("SBC active - MCU waiting/idle\n");
+            k_sleep(K_SECONDS(5));
         }
     }
 }
@@ -1311,6 +1294,14 @@ int handle_watchdog_recovery(void)
         send_at_command("AT+SHSTATE?");     // check if HTTPS is plausible
         
         int64_t start = k_uptime_get();
+
+        /*
+        due to cloudflare being annoying and not configurable for prototyping, at least on free plan or / if not self/local hosting, 
+        can remove this SHSTATE check (or keep) & just force reboot when it says that it's SHSTATE = 1 &or says SHSTATE = 1 after +++ (pppd)
+        OR check SHCONN message(s) instead of just wait_for_ok, but also for str starting with cloudfare (or garbage) and then insta-force reboot / poweroff
+        on modem which in return will trigger WDT for MCU in <30s, automatically setting up the system successfully again. 
+        */
+       
         while ((k_uptime_get() - start) < K_SECONDS(3).ticks) {
             if (strstr(response_buffer, "+SHSTATE:") != NULL) {
                 break; 
@@ -1432,7 +1423,7 @@ int main(void)
     // SBC handoff
     if (gpio_is_ready_dt(&sbc_handoff)) {
         gpio_pin_configure_dt(&sbc_handoff, GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_BOTH | GPIO_INT_WAKEUP);
+        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_BOTH);
         gpio_init_callback(&sbc_handoff_cb_data, sbc_handoff_callback, BIT(sbc_handoff.pin));
         gpio_add_callback(sbc_handoff.port, &sbc_handoff_cb_data);
         printk("SBC handoff pin configured with falling-edge interrupt\n");
@@ -1713,151 +1704,4 @@ arduino_spi: &spi2 {
 	status = "okay";
 };
 
-*/
-
-/* 1.2-031125 RTT logs of general operation (reliable but slow):
-05> Command data captured: NOCMD
-05> Received command: NOCMD
-05> Processing command: NOCMD
-05> No commands waiting
-05> >>> AT+SHREQ="/api/ack/device001/OK",1
-05> <<< OK
-05> <<< +SHREQ: "GET",200,2
-05> HTTPS Status: 200, Size: 2
-05> <<< NORMAL POWER DOWN
-05> <<< +APP PDP: 0,DEACTIVE
-05> Polling for commands...
-05> >>> AT+SHCHEAD
-05> *** Booting nRF Connect SDK v3.1.0-6c6e5b32496e ***
-05> *** Using Zephyr OS v4.1.99-1612683d4010 ***
-05> Watchdog started: [T: 30000ms]
-05> WDT RESET DETECTEDIoT Controller Starting...
-05> Button configured with interrupt
-05> Button2 configured with interrupt
-05> SBC handoff pin configured with falling-edge interrupt
-05> PWRKEY pin configured
-05> Watchdog reset detected
-05> INITIATING WDT RECOVERY
-05> >>> AT
-05> Starting polling thread...
-05> Response timeout
-05> Modem not ready yet (attempt 1/2). Retrying...
-05> >>> AT
-05> Response timeout
-05> Modem not ready yet (attempt 2/2). Retrying...
-05> Modem unresponsive â trying PPP escape (+++)
-05> Response timeout
-05> PPP escape failed â toggling PWRKEY
-05> <<< RDY
-05> <<< +CFUN: 1
-05> <<< +CPIN: READY
-05> <<< SMS Ready
-05> PWRKEY PULSED HIGH
-05> >>> AT
-05> <<< AT
-05> <<< OK
-05> Modem RESPONSIVE after PWRKEY TOGGLE
-05> [WDTR SUCCESS] - Boot #0 complete. Waiting for button press to start networking... unless WDTR
-05> Button triggered networking start!
-05> Setting up network...
-05> >>> AT+CMEE=2
-05> <<< AT+CMEE=2
-05> <<< OK
-05> >>> AT
-05> <<< AT
-05> <<< OK
-05> >>> ATE0
-05> <<< ATE0
-05> <<< OK
-05> >>> AT+IPR=921600
-05> <<< OK
-05> >>> AT+GMR
-05> <<< Revision:1951B16SIM7080
-05> <<< OK
-05> >>> AT+CPIN?
-05> <<< +CPIN: READY
-05> <<< OK
-05> >>> AT+CGREG=1
-05> <<< OK
-05> >>> AT+CGREG?
-05> <<< +CGREG: 1,1
-05> <<< OK
-05> >>> AT+CGDCONT=1,"IP","internet.telia.ee"
-05> <<< OK
-05> >>> AT+CNACT=0,1
-05> <<< OK
-05> <<< +APP PDP: 0,ACTIVE
-05> Network setup complete
-05> Setting up HTTPS session...
-05> >>> AT+SHSSL=0
-05> <<< OK
-05> >>> AT+SHTRDT
-05> <<< ERROR
-05> >>> AT+SHCHEAD
-05> <<< +CME ERROR: operation not allowed
-05> >>> AT+SHCPARA
-05> <<< +CME ERROR: operation not allowed
-05> Setting up certificate for HTTPS...
-05> >>> AT+CFSINIT
-05> <<< OK
-05> >>> AT+CFSDFILE=3,"server_ca.cer"
-05> <<< OK
-05> >>> AT+CFSWFILE=3,"server_ca.cer",0,1265,10000
-05> <<< DOWNLOAD
-05> <<< OK
-05> >>> AT+CFSTERM
-05> <<< OK
-05> >>> AT+CSSLCFG="convert",2,"server_ca.cer"
-05> <<< OK
-05> >>> AT+CSSLCFG="ignorertctime",1,1
-05> <<< OK
-05> >>> AT+CSSLCFG="sslversion",1,"3"
-05> <<< OK
-05> >>> AT+CSSLCFG="sni",1,"seven080-mcu-backend.onrender.com"
-05> <<< OK
-05> >>> AT+SHSSL=1,"server_ca.cer"
-05> <<< OK
-05> >>> AT+SHCONF="URL","https://seven080-mcu-backend.onrender.com"
-05> <<< OK
-05> >>> AT+SHCONF="BODYLEN",1024
-05> <<< OK
-05> >>> AT+SHCONF="HEADERLEN",350
-05> <<< OK
-05> >>> AT+CDNSGIP="seven080-mcu-backend.onrender.com"
-05> <<< OK
-05> <<< +CDNSGIP: 1,"seven080-mcu-backend.onrender.com","216.24.57.7"
-05> >>> AT+SHCONN
-05> <<< OK
-05> >>> AT+SHSTATE?
-05> <<< +SHSTATE: 1
-05> HTTPS Session State: Connected
-05> <<< OK
-05> HTTPS session setup complete
-05> Polling for commands...
-05> >>> AT+SHCHEAD
-05> <<< OK
-05> >>> AT+SHCPARA
-05> <<< OK
-05> >>> AT+SHAHEAD="User-Agent","nRF52-IoT-Controller"
-05> <<< OK
-05> >>> AT+SHAHEAD="Accept","/"
-05> <<< OK
-05> >>> AT+SHAHEAD="Cache-control","no-cache"
-05> <<< OK
-05> >>> AT+SHAHEAD="Connection","keep-alive"
-05> <<< OK
-05> >>> AT+SHREQ="/api/poll/device001",1
-05> <<< OK
-05> Waiting for +SHREQ response...
-05> <<< +SHREQ: "GET",200,5
-05> HTTPS Status: 200, Size: 5
-05> Boutta READ packet n=0
-05> >>> AT+SHREAD=0,5
-05> <<< OK
-05> <<< +SHREAD: 5
-05> <<< NOCMD
-05> Command data captured: NOCMD
-05> Received command: NOCMD
-05> Processing command: NOCMD
-05> No commands waiting
 */
