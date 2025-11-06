@@ -1,6 +1,6 @@
 /*
 
-v1.2-041125 [manual wdt disable]
+v1.2 051125-LPE-b
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
     Polls server every 10s for commands; polling 7<= can cause brownouts (currently close to pin 2x 220uF, 1x 100nF, 1x 10uF & away 5x 220uF extra)
@@ -38,10 +38,10 @@ HTTPS POLLING SIM7080-NRF52832DK
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
+#include <zephyr/pm/device.h> //????
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/watchdog.h>
-#include <zephyr/drivers/gpio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -1098,7 +1098,7 @@ bool end_ppp_session(void)
     uart_poll_out(uart0, '+');
     k_sleep(K_MSEC(3000)); // <-- increased from 1100 to 3000 ms
 
-    if (!wait_for_ok_error(K_SECONDS(5))) {
+    if (!wait_for_ok_error(K_SECONDS(3))) {
         printk("FAILED TO STOP PPP\n");
         return false;
     }
@@ -1124,27 +1124,26 @@ static void sbc_handoff_work_handler(struct k_work *work)
     printk("SBC handoff work handler (pin=%d)\n", val);
 
     if (val == 1) {
-        // SBC became active → relinquish
+        // SBC became active → relinquish control
         is_sbc_active = true;
         sbc_handoff_in_progress = false;
         printk("SBC ACTIVE → MCU cleans up\n");
         cleanup_http_session();
         
-        if (device_is_ready(uart0) && !pm_device_is_busy(uart0)){
+        if (device_is_ready(uart0) && !pm_device_is_busy(uart0)) {
             uart_tx_abort(uart0);
             pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
             printk("UART SUSPENDED\n");
         }
         watchdog_feed();
-        k_sleep(K_FOREVER);
+        // No k_sleep here—let polling thread sleep to avoid blocking workqueue
         return;
-    }
-    else{
+    } else {
         printk("SBC handed off → MCU resuming control\n");
         stats.handoff_count++;
         sbc_handoff_in_progress = true;
         is_sbc_active = false;
-        if (device_is_ready(uart0)){
+        if (device_is_ready(uart0)) {
             pm_device_action_run(uart0, PM_DEVICE_ACTION_RESUME);
             uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
             printk("UART RESUME\n");
@@ -1152,7 +1151,6 @@ static void sbc_handoff_work_handler(struct k_work *work)
     }
     sbc_handoff_in_progress = false;
     is_start_networking = true;
-
 
     // Retry PPP termination up to 4 times
     bool ended = false;
@@ -1212,7 +1210,8 @@ static void button_pressed_callback(const struct device *dev, struct gpio_callba
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
 {
     ARG_UNUSED(dev); ARG_UNUSED(callback); ARG_UNUSED(pins);
-    printk("SBC handoff IRQ -> scheduling sbc_handoff_work\n");
+    int current_val = gpio_pin_get_dt(&sbc_handoff);  // Read live state
+    printk("SBC handoff IRQ triggered! Pins: 0x%08x, Current pin state: %d\n", pins, current_val);
     k_work_submit(&sbc_handoff_work);
 }
 
@@ -1245,9 +1244,17 @@ void polling_thread(void)
             k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
             (http_state.last_status_code == 200) ? stats.poll_success++ : stats.poll_fail++;
         } else {
-            watchdog_feed();
-            printk("SBC active - MCU waiting/idle\n");
-            k_sleep(K_SECONDS(5));
+            static bool first_wait = true;
+            if (first_wait) {
+                printk("SBC Active - low power wait (wake on handoff IRQ)");
+                first_wait = false;
+            }
+            // SBC active: Low-power loop with WDT feed (wakes only on IRQ)
+            while (is_sbc_active) {
+                watchdog_feed();  // Feed every iteration
+                k_sleep(K_SECONDS(20));  // Sleep 20s; IRQ can wake mid-sleep
+            }
+            first_wait = true;            // Exits loop on handoff (is_sbc_active=false from work handler)
         }
     }
 }
@@ -1325,9 +1332,7 @@ int handle_watchdog_recovery(void)
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(1400));
-
-    if (wait_for_ok_error(K_MSEC(1000))) { //if +++ responds with OK it's most certainly back from PPP and will have certs
+    if (wait_for_ok_error(K_MSEC(1400))) { //if +++ responds with OK it's most certainly back from PPP and will have certs
         printk("PPP escape succeeded\n");
         uart_state.is_certificate_setup = true;
         return 0;
