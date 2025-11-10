@@ -45,7 +45,13 @@ HTTPS POLLING SIM7080-NRF52832DK
 #include <zephyr/drivers/watchdog.h>
 #include <string.h>
 #include <stdlib.h>
-
+// PM (POWER MANAGEMENT)
+#include <zephyr/pm/device.h>
+#include <ram_pwrdn.h> //power_down_unused_ram(), power_up_unused_ram()
+#include <zephyr/pm/pm.h>
+#include <zephyr/pm/policy.h>
+#include <zephyr/pm/device_runtime.h>
+#include <hal/nrf_power.h>
 
 // UART CONFIGURATION
 #define BAUD_RATE                   921600
@@ -91,6 +97,7 @@ static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigg
 static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 static int wdt_channel_id;
 
+
 // STATE STRUCTURES
 typedef struct {
     bool is_connected;
@@ -121,7 +128,8 @@ typedef struct {
     uint32_t handoff_count;
     uint32_t resent_count;
 } device_stats_t;
-static device_stats_t stats = {0};
+__attribute__((section(".noinit")))
+static device_stats_t stats;
 
 // SBC HANDOFF ENHANCEMENTS
 static volatile bool sbc_handoff_in_progress = false;
@@ -129,12 +137,15 @@ static char pending_ack_cmd[128];
 static bool pending_ack = false;
 
 // GLOBAL STATE
-static http_state_t http_state = {0};
+__attribute__((section(".noinit")))
+static http_state_t http_state;
 static power_state_t power_state = {0};
 static uart_state_t uart_state = {0};
 
 static bool is_start_networking = false;
+__attribute__((section(".noinit")))
 static bool is_sbc_active = false;
+__attribute__((section(".noinit")))
 static int packet_counter = 0;
 
 
@@ -239,7 +250,6 @@ static void button_pressed_callback(const struct device *dev, struct gpio_callba
 static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_work_handler(struct k_work *work);
-static void wdt_config_work_handler(struct k_work *work);
 
 
 // THREADS
@@ -253,6 +263,9 @@ int handle_watchdog_recovery(void);
 
 //debugging-tooling for wdt
 bool is_skip_wdt = false;
+
+//LOW POWER FUNCTIONS
+void enter_sbc_active_sleep(void);
 
 
 // UART PARSING ---------------------------------------------------------------------
@@ -403,7 +416,7 @@ bool wait_for_ok_error(k_timeout_t timeout)
         if (is_in_recovery){
             watchdog_feed();
         }
-        k_msleep(is_in_recovery ? 7 : 50); //when in recovery from wdt, use 7ms for much speedier response
+        k_msleep(is_in_recovery ? 45 : 50); //when in recovery from wdt, use 7ms for much speedier response idk maybe 45 is more stable maybe not??? 
     }
 
     if (!uart_state.is_response_complete) {
@@ -1099,8 +1112,6 @@ bool end_ppp_session(void)
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(3000)); // <-- increased from 1100 to 3000 ms
-
     if (!wait_for_ok_error(K_SECONDS(5))) {
         printk("FAILED TO STOP PPP\n");
         return false;
@@ -1301,7 +1312,7 @@ int handle_watchdog_recovery(void)
         OR check SHCONN message(s) instead of just wait_for_ok, but also for str starting with cloudfare (or garbage) and then insta-force reboot / poweroff
         on modem which in return will trigger WDT for MCU in <30s, automatically setting up the system successfully again. 
         */
-       
+
         while ((k_uptime_get() - start) < K_SECONDS(3).ticks) {
             if (strstr(response_buffer, "+SHSTATE:") != NULL) {
                 break; 
@@ -1352,12 +1363,64 @@ int handle_watchdog_recovery(void)
     return modem_full_reset();
 }
 
+void configure_ram_retention(void)
+{
+    /* 
+     * nRF52832 RAM block layout:
+     * Block 0: 0x20000000 - 0x20001FFF (8KB)
+     * Block 1: 0x20002000 - 0x20003FFF (8KB)
+     * Block 2: 0x20004000 - 0x20005FFF (8KB)
+     * Block 3: 0x20006000 - 0x20007FFF (8KB)
+     * Block 4: 0x20008000 - 0x20009FFF (8KB)
+     * Block 5: 0x2000A000 - 0x2000BFFF (8KB)
+     * Block 6: 0x2000C000 - 0x2000DFFF (8KB)
+     * Block 7: 0x2000E000 - 0x2000FFFF (8KB)
+     */
+    
+    /* Enable retention for blocks 0,1,2 */
+    NRF_POWER->RAM[0].POWERSET = 0xFFFFFFFF;  // Retain block 0
+    NRF_POWER->RAM[1].POWERSET = 0xFFFFFFFF;  // Retain block 1
+    NRF_POWER->RAM[2].POWERSET = 0xFFFFFFFF;  // Retain block 2
+    
+    /* Power down blocks 3-7 to save power */
+    NRF_POWER->RAM[3].POWERCLR = 0xFFFFFFFF;  // Power off block 3
+    NRF_POWER->RAM[4].POWERCLR = 0xFFFFFFFF;  // Power off block 4
+    NRF_POWER->RAM[5].POWERCLR = 0xFFFFFFFF;  // Power off block 5
+    NRF_POWER->RAM[6].POWERCLR = 0xFFFFFFFF;  // Power off block 6
+    NRF_POWER->RAM[7].POWERCLR = 0xFFFFFFFF;  // Power off block 7
+
+    
+    printk("RAM retention: Blocks 0-2 retained, 3-7 powered off\n");
+}
+
+void enter_sbc_active_sleep(void){
+    watchdog_feed();
+    volatile device_stats_t *stats_ptr = &stats;
+    volatile bool *sbc_ptr = &is_sbc_active;
+
+    configure_ram_retention();
+
+    nrf_gpio_cfg_sense_set(sbc_handoff.pin, NRF_GPIO_PIN_SENSE_LOW);
+
+    printk("Enterint sys OFF (SBC active) - RAM blocks 0-2 retained\n");
+    nrf_power_system_off(NRF_POWER);
+}
 
 K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
 
 
 int main(void)
 {
+    uint32_t reset_reason = nrf_power_resetreas_get(NRF_POWER);
+    if (reset_reason & NRF_POWER_RESETREAS_OFF_MASK) {
+        printk("Wake from sysoff\n");
+        
+        is_sbc_active = false;
+        uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
+        
+        nrf_gpio_cfg_sense_set(sbc_handoff.pin, NRF_GPIO_PIN_SENSE_HIGH);
+    }
+
     if (gpio_is_ready_dt(&led2)) gpio_pin_configure_dt(&led2, GPIO_OUTPUT_INACTIVE);
     if (gpio_is_ready_dt(&button3)) {
         gpio_pin_set_dt(&led2, 1);
@@ -1372,6 +1435,7 @@ int main(void)
             k_sleep(K_MSEC(100));
         }
     }
+
     gpio_pin_set_dt(&led2, 0);
     if (!is_skip_wdt) watchdog_init();
     else printk("DEBUG MODE [WDT DISABLED MANUALLY]\n");
