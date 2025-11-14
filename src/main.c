@@ -1,6 +1,6 @@
 /*
 
-v1.2-041125a [CLOUDFLARE DoS PROTECTION NOT MITIGATED]
+v1.3-121125LPE-s2
     -cloudfare DoS issue mentioned at ln1300
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
@@ -27,14 +27,26 @@ HTTPS POLLING SIM7080-NRF52832DK
      v1.2-031125 - tested wdt+pwrkey+logging, reliable but slow
      v1.2-031125a - Optimizations + on-board debugger for enable/disable wdt added [untested] - redacted, 04 replaced w other logic
      *v1.2-041125a - Majorly working version. [gets blocked by cloudflare & wdt doesnt account for this]
-     v1.3-xx implementing PSM/eDRX & testing
-    24- todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
+    v1.3-121125LPE - UNTESTED - Debug b3 + wdt recover + Power management (SLEEP) + GPIO sense; BASED ON 041125a & 071125-d:11-121125
+        s2-> more optimizations, but it is still a bit scuffed, some weirdness overall works tho..! (tested) - w/o SBC tho
+    24-10 todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
     **Superstable
     *Stable
     .dts added below (bottom) as git doesn't track it
 
 */
 
+/*
+v1.3-121125LPE NOTE
+
+linker.ld MIGHT NEED CONFIRMATION
+if SLEEP WORKS might need attribute noinit for other vars too
+    .noinit (NOLOAD) :
+    {
+        *(.noinit*)
+    } > RAM
+--->linker.ld confirmation idk tf it is im hopping off now 
+*/
 
 // ZEPHYR RTOS INCLUDES
 #include <zephyr/kernel.h>
@@ -45,13 +57,11 @@ HTTPS POLLING SIM7080-NRF52832DK
 #include <zephyr/drivers/watchdog.h>
 #include <string.h>
 #include <stdlib.h>
-// PM (POWER MANAGEMENT)
+
 #include <zephyr/pm/device.h>
-#include <ram_pwrdn.h> //power_down_unused_ram(), power_up_unused_ram()
-#include <zephyr/pm/pm.h>
-#include <zephyr/pm/policy.h>
-#include <zephyr/pm/device_runtime.h>
 #include <hal/nrf_power.h>
+#include <hal/nrf_gpio.h>
+
 
 // UART CONFIGURATION
 #define BAUD_RATE                   921600
@@ -91,12 +101,15 @@ static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger0), gpios, {0}); // P0.11 to SBC
 static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios); // MCU P0.28 << P32 SBC
 
-// Power key pin (not used yet)
+// Power key pin
 static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
 // Watchdog
 static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 static int wdt_channel_id;
 
+static __attribute__((section(".noinit"))) bool was_sleeping;
+static __attribute__((section(".noinit"))) uint32_t sleep_count;
+static __attribute__((section(".noinit"))) uint32_t wake_count;
 
 // STATE STRUCTURES
 typedef struct {
@@ -106,11 +119,15 @@ typedef struct {
     int last_data_size;
     bool is_shreq_received;
 } http_state_t;
+__attribute__((section(".noinit")))
+static http_state_t http_state;
 
 typedef struct {
     bool is_psm_enabled;
     bool is_edrx_enabled;
 } power_state_t;
+__attribute__((section(".noinit")))
+static power_state_t power_state;
 
 typedef struct {
     bool is_certificate_setup;
@@ -119,6 +136,8 @@ typedef struct {
     bool is_waiting_for_response;
     size_t response_length;
 } uart_state_t;
+__attribute__((section(".noinit")))
+static uart_state_t uart_state;
 
 // logging
 typedef struct {
@@ -129,7 +148,7 @@ typedef struct {
     uint32_t resent_count;
 } device_stats_t;
 __attribute__((section(".noinit")))
-static device_stats_t stats;
+static device_stats_t stats; //RAM RETENTION
 
 // SBC HANDOFF ENHANCEMENTS
 static volatile bool sbc_handoff_in_progress = false;
@@ -137,15 +156,12 @@ static char pending_ack_cmd[128];
 static bool pending_ack = false;
 
 // GLOBAL STATE
-__attribute__((section(".noinit")))
-static http_state_t http_state;
-static power_state_t power_state = {0};
-static uart_state_t uart_state = {0};
+//static http_state_t http_state = {0};
+//static power_state_t power_state = {0};
+//static uart_state_t uart_state = {0};
 
 static bool is_start_networking = false;
-__attribute__((section(".noinit")))
 static bool is_sbc_active = false;
-__attribute__((section(".noinit")))
 static int packet_counter = 0;
 
 
@@ -161,6 +177,7 @@ static struct k_work pwrkey_work;
 static struct gpio_callback button_callback_data;
 static struct gpio_callback button2_callback_data;
 static struct gpio_callback sbc_handoff_cb_data;
+static struct gpio_callback button3_callback_data;
 
 // CERTIFICATE DATA
 
@@ -250,7 +267,9 @@ static void button_pressed_callback(const struct device *dev, struct gpio_callba
 static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins);
 static void sbc_handoff_work_handler(struct k_work *work);
-
+static void button3_pressed_callback(const struct device *dev, 
+                                        struct gpio_callback *callback, 
+                                        uint32_t pins);
 
 // THREADS
 void polling_thread(void);
@@ -264,8 +283,18 @@ int handle_watchdog_recovery(void);
 //debugging-tooling for wdt
 bool is_skip_wdt = false;
 
-//LOW POWER FUNCTIONS
-void enter_sbc_active_sleep(void);
+static volatile bool sleep_requested = false;
+static volatile bool manual_sleep_trigger = false;
+
+static void enter_system_off_sleep(void);
+static void prepare_for_sleep(void);
+static void wake_from_sleep(void);
+static bool should_enter_sleep(void);
+static void handle_sleep_wake_detection(void);
+void request_sleep(void);
+void trigger_manual_sleep(void);
+
+static void init_retained_state(bool);
 
 
 // UART PARSING ---------------------------------------------------------------------
@@ -416,7 +445,7 @@ bool wait_for_ok_error(k_timeout_t timeout)
         if (is_in_recovery){
             watchdog_feed();
         }
-        k_msleep(is_in_recovery ? 45 : 50); //when in recovery from wdt, use 7ms for much speedier response idk maybe 45 is more stable maybe not??? 
+        k_msleep(is_in_recovery ? 7 : 50); //when in recovery from wdt, use 7ms for much speedier response
     }
 
     if (!uart_state.is_response_complete) {
@@ -779,6 +808,8 @@ void poll_for_commands(void)
         return;
     }
     
+    watchdog_feed();
+
     if (http_state.last_status_code == 200 && http_state.last_data_size > 0) {
         memset(command_data, 0, sizeof(command_data));
         is_command_received = false;
@@ -1112,6 +1143,8 @@ bool end_ppp_session(void)
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
     uart_poll_out(uart0, '+');
+    k_sleep(K_MSEC(3000)); // <-- increased from 1100 to 3000 ms
+
     if (!wait_for_ok_error(K_SECONDS(5))) {
         printk("FAILED TO STOP PPP\n");
         return false;
@@ -1210,11 +1243,33 @@ static void button_pressed_callback(const struct device *dev, struct gpio_callba
     is_start_networking = true;
 }
 
-static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
+static void sbc_handoff_callback(const struct device *dev, 
+                                 struct gpio_callback *callback, 
+                                 uint32_t pins)
 {
-    ARG_UNUSED(dev); ARG_UNUSED(callback); ARG_UNUSED(pins);
-    printk("SBC handoff IRQ -> scheduling sbc_handoff_work\n");
-    k_work_submit(&sbc_handoff_work);
+    ARG_UNUSED(dev); 
+    ARG_UNUSED(callback); 
+    ARG_UNUSED(pins);
+    
+    int pin_state = gpio_pin_get_dt(&sbc_handoff);
+    
+    if (pin_state == 1) {
+        // SBC became active (pin went HIGH)
+        printk("SBC handoff IRQ: SBC taking control (pin HIGH)\n");
+        is_sbc_active = true;
+        sbc_handoff_in_progress = false;
+        
+        // Request sleep after brief delay
+        printk("Scheduling sleep in 1 second...\n");
+        // Could use a work queue here for delayed sleep
+        request_sleep();
+        
+    } else {
+        // SBC handed off (pin went LOW) - MCU should wake
+        printk("SBC handoff IRQ: SBC releasing control (pin LOW)\n");
+        printk("Scheduling handoff work\n");
+        k_work_submit(&sbc_handoff_work);
+    }
 }
 
 static void button2_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
@@ -1230,24 +1285,93 @@ static void button2_pressed_callback(const struct device *dev, struct gpio_callb
 void polling_thread(void)
 {
     printk("Starting polling thread...\n");
+    
     while (!is_start_networking) {
+        if (should_enter_sleep()) {
+            enter_system_off_sleep();
+        }
         k_sleep(K_MSEC(100));
     }
-    printk("Button triggered networking start!\n");
     
-    if (!setup_network()) {
-        printk("Network setup failed!\n");
-        return;
+    // Check if this is a wake event
+    bool is_wake_event = (wake_count > 0 && sleep_count > 0);
+    
+    if (is_wake_event) {
+        printk("=== WAKE EVENT #%u - SMART RESUME ===\n", wake_count);
+        
+        watchdog_feed();
+        
+        // FAST PATH: Try retained session
+        if (http_state.is_session_active) {
+            printk("Attempting instant resume with retained session...\n");
+            
+            // Quick modem check
+            send_at_command("AT");
+            if (wait_for_ok_error(K_SECONDS(2))) {
+                // Verify HTTPS session
+                send_at_command("AT+SHSTATE?");
+                if (wait_for_response_with_timeout("+SHSTATE: 1", K_SECONDS(2))) {
+                    printk("HTTPS SESSION RETAINED - INSTANT RESUME!\n");
+                    goto resume_polling; // Skip full setup
+                }
+            }
+            printk("✗ Session lost - full reconnection needed\n");
+        }
+        
+        // SLOW PATH: Full reconnection
+        printk("Performing full reconnection...\n");
+        http_state.is_session_active = false;
+        http_state.is_connected = false;
+        
+        watchdog_feed();
+        
+        if (!setup_network()) {
+            printk("Network setup failed after wake!\n");
+            return;
+        }
+        
+        watchdog_feed();
+        
+        if (!setup_https_session()) {
+            printk("HTTPS setup failed after wake!\n");
+            return;
+        }
+        
+    } else {
+        // First boot - button triggered
+        printk("Button triggered networking start!\n");
+        
+        watchdog_feed();
+        
+        if (!setup_network()) {
+            printk("Network setup failed!\n");
+            return;
+        }
     }
     
+resume_polling:
+    printk("=== ENTERING POLLING LOOP ===\n");
+    
+    // Normal polling loop
     while (1) {
+        if (should_enter_sleep()) {
+            printk("Sleep condition detected - entering sleep in 2s\n");
+            k_sleep(K_SECONDS(2));
+            
+            if (should_enter_sleep()) {
+                enter_system_off_sleep();
+            } else {
+                printk("Sleep condition cleared during delay\n");
+            }
+        }
+        
         if (!is_sbc_active) {
             poll_for_commands();
             k_sleep(K_SECONDS(POLL_INTERVAL_SEC));
             (http_state.last_status_code == 200) ? stats.poll_success++ : stats.poll_fail++;
         } else {
             watchdog_feed();
-            printk("SBC active - MCU waiting/idle\n");
+            printk("SBC active - MCU idle\n");
             k_sleep(K_SECONDS(5));
         }
     }
@@ -1312,7 +1436,7 @@ int handle_watchdog_recovery(void)
         OR check SHCONN message(s) instead of just wait_for_ok, but also for str starting with cloudfare (or garbage) and then insta-force reboot / poweroff
         on modem which in return will trigger WDT for MCU in <30s, automatically setting up the system successfully again. 
         */
-
+       
         while ((k_uptime_get() - start) < K_SECONDS(3).ticks) {
             if (strstr(response_buffer, "+SHSTATE:") != NULL) {
                 break; 
@@ -1363,47 +1487,211 @@ int handle_watchdog_recovery(void)
     return modem_full_reset();
 }
 
-void configure_ram_retention(void)
-{
-    /* 
-     * nRF52832 RAM block layout:
-     * Block 0: 0x20000000 - 0x20001FFF (8KB)
-     * Block 1: 0x20002000 - 0x20003FFF (8KB)
-     * Block 2: 0x20004000 - 0x20005FFF (8KB)
-     * Block 3: 0x20006000 - 0x20007FFF (8KB)
-     * Block 4: 0x20008000 - 0x20009FFF (8KB)
-     * Block 5: 0x2000A000 - 0x2000BFFF (8KB)
-     * Block 6: 0x2000C000 - 0x2000DFFF (8KB)
-     * Block 7: 0x2000E000 - 0x2000FFFF (8KB)
-     */
-    
-    /* Enable retention for blocks 0,1,2 */
-    NRF_POWER->RAM[0].POWERSET = 0xFFFFFFFF;  // Retain block 0
-    NRF_POWER->RAM[1].POWERSET = 0xFFFFFFFF;  // Retain block 1
-    NRF_POWER->RAM[2].POWERSET = 0xFFFFFFFF;  // Retain block 2
-    
-    /* Power down blocks 3-7 to save power */
-    NRF_POWER->RAM[3].POWERCLR = 0xFFFFFFFF;  // Power off block 3
-    NRF_POWER->RAM[4].POWERCLR = 0xFFFFFFFF;  // Power off block 4
-    NRF_POWER->RAM[5].POWERCLR = 0xFFFFFFFF;  // Power off block 5
-    NRF_POWER->RAM[6].POWERCLR = 0xFFFFFFFF;  // Power off block 6
-    NRF_POWER->RAM[7].POWERCLR = 0xFFFFFFFF;  // Power off block 7
 
+// SLEEP FUNCTIONALITY -----------------------------
+
+static void prepare_for_sleep(void)
+{
+    printk("\n    PREPARING FOR SLEEP    \n");
+    printk("Sleep count: %u, Wake count: %u\n", sleep_count + 1, wake_count);
     
-    printk("RAM retention: Blocks 0-2 retained, 3-7 powered off\n");
+    // Mark that we're going to sleep
+    was_sleeping = true;
+    sleep_count++;
+    
+    // Disable watchdog if it's running (can't run in System OFF)
+    if (!is_skip_wdt && wdt && device_is_ready(wdt)) {
+        wdt_disable(wdt);
+        printk("WDT disabled\n");
+    }
+    
+    // Suspend UART
+    if (device_is_ready(uart0)) {
+        pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
+        printk("UART suspended\n");
+    }
+    
+    // Turn off all LEDs for power saving
+    gpio_pin_set_dt(&led0, 0);
+    gpio_pin_set_dt(&led1, 0);
+    gpio_pin_set_dt(&led2, 0);
+    
+    // Allow UART to flush
+    k_sleep(K_MSEC(100));
+    
+    printk("Sleep preparation complete\n");
 }
 
-void enter_sbc_active_sleep(void){
-    watchdog_feed();
-    volatile device_stats_t *stats_ptr = &stats;
-    volatile bool *sbc_ptr = &is_sbc_active;
 
-    configure_ram_retention();
+static void wake_from_sleep(void)
+{
+    wake_count++;
+    
+    printk("   WAKE FROM SYSTEM OFF DETECTED   \n");
+    printk("Sleep sessions: %u, Wake events: %u\n", sleep_count, wake_count);
+    
+    // Resume UART with async RX
+    if (device_is_ready(uart0)) {
+        pm_device_action_run(uart0, PM_DEVICE_ACTION_RESUME);
+        uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
+        printk("UART resumed\n");
+    }
+    
+    // Re-initialize watchdog if it wasn't disabled at boot
+    if (!is_skip_wdt) {
+        watchdog_init();
+    } else {
+        printk("WDT remains disabled (debug mode)\n");
+    }
+    
+    // Visual feedback - blink LED1
+    for (int i = 0; i < 3; i++) {
+        gpio_pin_set_dt(&led1, 1);
+        k_sleep(K_MSEC(100));
+        gpio_pin_set_dt(&led1, 0);
+        k_sleep(K_MSEC(100));
+    }
+    
+    // Reset sleep flags
+    was_sleeping = false;
+    sleep_requested = false;
+    manual_sleep_trigger = false;
 
-    nrf_gpio_cfg_sense_set(sbc_handoff.pin, NRF_GPIO_PIN_SENSE_LOW);
+    is_start_networking = true;
+    
+    printk("Wake sequence complete - resuming normal operation\n\n");
+    printk("Retained session state: HTTP=%d, Certs=%d\n", http_state.is_session_active, uart_state.is_certificate_setup);
+}
 
-    printk("Enterint sys OFF (SBC active) - RAM blocks 0-2 retained\n");
+
+static void enter_system_off_sleep(void)
+{
+    printk("  ENTERING SYSTEM OFF SLEEP MODE   \n");
+    
+    prepare_for_sleep();
+    
+    // Configure P0.28 (sbc_handoff) as wake source
+    // Wake when pin goes LOW (SBC hands off control)
+    nrf_gpio_cfg_sense_input(sbc_handoff.pin, 
+                            NRF_GPIO_PIN_PULLUP, 
+                            NRF_GPIO_PIN_SENSE_LOW);
+    
+    printk("GPIO wake configured: P0.%d (sense LOW)\n", sbc_handoff.pin);
+    
+    // RAM RETENTION YIWAUYGDIYGAWFOUYGAWFYUGAWFUYGAWYUFGAWIYUDKAJWHCXKJAWSHDKJH
+    // Retain first 32KB (blocks 0-3) for var
+    for (int i = 0; i < 4; i++) {
+        NRF_POWER->RAM[i].POWERSET = 0xFFFFFFFF;
+    }
+    printk("RAM retention configured (32KB)\n");
+    
+    // Final delay before sleep
+    k_sleep(K_MSEC(50));
+    
+    printk("Entering System OFF NOW...\n");
+    
+    // Enter System OFF - this does not return
+    // Device will reset when P0.28 goes LOW
     nrf_power_system_off(NRF_POWER);
+    
+    // Never reached
+    CODE_UNREACHABLE;
+}
+
+
+static bool should_enter_sleep(void)
+{
+    // Manual sleep trigger (button press)
+    if (manual_sleep_trigger) {
+        printk("Manual sleep trigger detected\n");
+        return true;
+    }
+    
+    // Auto-sleep when SBC is active
+    if (is_sbc_active && !sbc_handoff_in_progress) {
+        int pin_state = gpio_pin_get_dt(&sbc_handoff);
+        if (pin_state == 1) { // SBC holding pin HIGH
+            printk("SBC active (pin HIGH) - auto-sleep condition met\n");
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+
+static void handle_sleep_wake_detection(void)
+{
+    uint32_t reset_reason = nrf_power_resetreas_get(NRF_POWER);
+    bool is_cold_boot = true;
+    
+    // Check if waking from System OFF
+    if (reset_reason & NRF_POWER_RESETREAS_OFF_MASK) {
+        printk("RESETREAS: System OFF wake detected (0x%08X)\n", reset_reason);
+        
+        if (was_sleeping) {
+            // This was an intentional sleep, not a cold boot
+            is_cold_boot = false;
+            wake_from_sleep();
+        } else {
+            // Unexpected System OFF - could be power loss
+            printk("WARNING: System OFF without sleep flag set\n");
+            printk("Possible power loss or unintended reset\n");
+            sleep_count = 0;
+            wake_count = 0;
+        }
+        
+        // Clear reset reason
+        nrf_power_resetreas_clear(NRF_POWER, 0xFFFFFFFF);
+    } else {
+        // Normal boot (not from System OFF)
+        printk("RESETREAS: Cold boot (0x%08X)\n", reset_reason);
+        was_sleeping = false;
+        sleep_count = 0;
+        wake_count = 0;
+    }
+    init_retained_state(is_cold_boot);
+}
+
+
+void request_sleep(void)
+{
+    printk("Sleep requested\n");
+    sleep_requested = true;
+}
+
+void trigger_manual_sleep(void)
+{
+    printk("Manual sleep trigger activated\n");
+    manual_sleep_trigger = true;
+}
+
+
+static void button3_pressed_callback(const struct device *dev, 
+                                     struct gpio_callback *callback, 
+                                     uint32_t pins)
+{
+    ARG_UNUSED(dev); 
+    ARG_UNUSED(callback); 
+    ARG_UNUSED(pins);
+    
+    printk("SW3 pressed - triggering manual sleep in 2 seconds...\n");
+    printk("(Press SW0 to cancel by starting networking)\n");
+    trigger_manual_sleep();
+}
+
+static void init_retained_state(bool is_cold_boot){
+    if (is_cold_boot){
+        printk("Cold boot retained state init\n");
+        memset(&http_state, 0, sizeof(http_state));
+        memset(&power_state, 0, sizeof(power_state));
+        memset(&power_state, 0, sizeof(uart_state));
+    } else {
+        printk("Wake from sleep - retained state preserved\n");
+        printk("  HTTP: connected=%d, session_active=%d\n", http_state.is_connected, http_state.is_session_active);
+        printk("  UART: cert_setup=%d\n", uart_state.is_certificate_setup);
+        printk("  Power: psm=%d, edrx=%d\n", power_state.is_psm_enabled, power_state.is_edrx_enabled);
+    }
 }
 
 K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
@@ -1411,15 +1699,6 @@ K_THREAD_DEFINE(polling_tid, 4096, polling_thread, NULL, NULL, NULL, 7, 0, 0);
 
 int main(void)
 {
-    uint32_t reset_reason = nrf_power_resetreas_get(NRF_POWER);
-    if (reset_reason & NRF_POWER_RESETREAS_OFF_MASK) {
-        printk("Wake from sysoff\n");
-        
-        is_sbc_active = false;
-        uart_rx_enable(uart0, rx_buffer, sizeof(rx_buffer), RX_TIMEOUT_DELAY);
-        
-        nrf_gpio_cfg_sense_set(sbc_handoff.pin, NRF_GPIO_PIN_SENSE_HIGH);
-    }
 
     if (gpio_is_ready_dt(&led2)) gpio_pin_configure_dt(&led2, GPIO_OUTPUT_INACTIVE);
     if (gpio_is_ready_dt(&button3)) {
@@ -1437,8 +1716,12 @@ int main(void)
     }
 
     gpio_pin_set_dt(&led2, 0);
+
+    handle_sleep_wake_detection();
+
     if (!is_skip_wdt) watchdog_init();
     else printk("DEBUG MODE [WDT DISABLED MANUALLY]\n");
+
     uint32_t rr = NRF_POWER->RESETREAS;
     if (rr & POWER_RESETREAS_DOG_Msk) printk("WDT RESET DETECTED");
 
@@ -1508,6 +1791,14 @@ int main(void)
         if (handle_watchdog_recovery() == 0) is_start_networking = true;
         (is_start_networking == true) ? printk("[WDTR SUCCESS] - ") : printk("[WDTR ERROR] - ");
         is_in_recovery = false;
+    }
+
+    if (gpio_is_ready_dt(&button3)) {
+    gpio_pin_interrupt_configure_dt(&button3, GPIO_INT_EDGE_TO_ACTIVE);
+    gpio_init_callback(&button3_callback_data, button3_pressed_callback, 
+                    BIT(button3.pin));
+    gpio_add_callback(button3.port, &button3_callback_data);
+    printk("Button3 (SW3) configured for sleep trigger\n");
     }
 
     printk("Boot #%u complete. Waiting for button press to start networking... unless WDTR\n", stats.boot_count++);
