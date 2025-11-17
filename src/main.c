@@ -1,6 +1,6 @@
 /*
 
-v1.3-121125LPE-s2
+v1.3-121125LPE-s3
     -cloudfare DoS issue mentioned at ln1300
 HTTPS POLLING SIM7080-NRF52832DK
     Works via setting up networking (APN), then HTTPS session w/ certs
@@ -28,7 +28,7 @@ HTTPS POLLING SIM7080-NRF52832DK
      v1.2-031125a - Optimizations + on-board debugger for enable/disable wdt added [untested] - redacted, 04 replaced w other logic
      *v1.2-041125a - Majorly working version. [gets blocked by cloudflare & wdt doesnt account for this]
     v1.3-121125LPE - UNTESTED - Debug b3 + wdt recover + Power management (SLEEP) + GPIO sense; BASED ON 041125a & 071125-d:11-121125
-        s2-> more optimizations, but it is still a bit scuffed, some weirdness overall works tho..! (tested) - w/o SBC tho
+        s3-> modem starts speakin eubonics when handoff from sbc & normal btn wake doesnt work anymore like it did with s2
     24-10 todo: PWRKEY, cloudfare fix?, more testing, power states, nRF sleepstates, add-on watchdog for stuck states
     **Superstable
     *Stable
@@ -506,6 +506,7 @@ static bool setup_default_headers(void)
     if (!set_http_header("Accept", "*/*")) return false;
     if (!set_http_header("Cache-control", "no-cache")) return false;
     if (!set_http_header("Connection", "keep-alive")) return false;
+    if (!set_http_header("Accept-Encoding","identity")) return false; //can be removed (s3)
     return true;
 }
 
@@ -719,7 +720,8 @@ bool setup_https_session(void)
     wait_for_ok_error(K_SECONDS(10));
     k_sleep(K_SECONDS(2));
 
-    if (!send_at_and_wait_ok("AT+SHCONN", K_SECONDS(30))) {
+    watchdog_feed();
+    if (!send_at_and_wait_ok("AT+SHCONN", K_SECONDS(20))) {
         printk("HTTPS connection failed\n");
         return false;
     }
@@ -1306,6 +1308,12 @@ void polling_thread(void)
             printk("Attempting instant resume with retained session...\n");
             
             // Quick modem check
+            // clears pppd
+            k_sleep(K_MSEC(1100));
+            uart_poll_out(uart0, '+');
+            uart_poll_out(uart0, '+');
+            uart_poll_out(uart0, '+');
+            wait_for_ok_error(K_MSEC(1500));
             send_at_command("AT");
             if (wait_for_ok_error(K_SECONDS(2))) {
                 // Verify HTTPS session
@@ -1317,7 +1325,7 @@ void polling_thread(void)
             }
             printk("✗ Session lost - full reconnection needed\n");
         }
-        
+
         // SLOW PATH: Full reconnection
         printk("Performing full reconnection...\n");
         http_state.is_session_active = false;
@@ -1685,7 +1693,7 @@ static void init_retained_state(bool is_cold_boot){
         printk("Cold boot retained state init\n");
         memset(&http_state, 0, sizeof(http_state));
         memset(&power_state, 0, sizeof(power_state));
-        memset(&power_state, 0, sizeof(uart_state));
+        memset(&uart_state, 0, sizeof(uart_state)); //s3 good fix to have
     } else {
         printk("Wake from sleep - retained state preserved\n");
         printk("  HTTP: connected=%d, session_active=%d\n", http_state.is_connected, http_state.is_session_active);
