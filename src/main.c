@@ -1,9 +1,9 @@
 /*
-    FSM-v2.0LPE 
-        unholy edition
+    FSM-v2.1LPE 
+        superfast edition
         *handoff x true deep sleep x https x fast setup x pwrkey x fallback (basic) x wdt (basic) x STABLE x UX logging 
         TESTED - near v1.3-121125 functionality parity achieved* with -1200loc
-    21/11/2025    
+    21/11/2025    *fixed potential SHCONN hangs, 2h+ uptime stable tested, wdt should work now* 
 */
 
 #include <zephyr/kernel.h>
@@ -12,6 +12,7 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/watchdog.h>
+#include <zephyr/sys/reboot.h> 
 #include <string.h>
 #include <stdlib.h>
 #include <zephyr/pm/device.h>
@@ -27,8 +28,10 @@
 
 // TIMING
 #define PWRKEY_PRESS_MS             1100
-#define MODEM_BOOT_WAIT_SEC         10
+#define MODEM_BOOT_WAIT_SEC         6       
 #define POLL_INTERVAL_SEC           10
+#define MAX_CONSECUTIVE_FAILS       3       
+#define MAX_HARD_RESETS             3       
 
 // SERVER
 #define SERVER_HOST                 "seven080-mcu-backend.onrender.com"
@@ -77,6 +80,11 @@ static int wdt_channel_id = -1;
 static bool is_skip_wdt = false;
 static bool flag_start_network = false;
 static bool flag_sbc_active = false;
+static volatile bool flag_modem_brownout = false; // ISR Flag
+
+// COUNTERS
+static int consecutive_fails = 0;
+static int hard_reset_count = 0;
 
 // UART
 static uint8_t rx_buf[RX_BUF_SIZE];
@@ -127,6 +135,14 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
                 response_buffer[response_len] = '\0';
             }
         }
+        
+        // BROWNOUT DETECTION
+        // If modem resets, it sends "RDY" or "NORMAL POWER DOWN"
+        if (strstr(response_buffer, "RDY") || strstr(response_buffer, "POWER DOWN")) {
+            flag_modem_brownout = true;
+            response_complete = true; // Force exit
+        }
+
         if (strstr(response_buffer, "OK\r\n") || 
             strstr(response_buffer, "ERROR") || 
             strstr(response_buffer, "+CME ERROR")) {
@@ -165,12 +181,20 @@ bool send_at(const char *cmd, k_timeout_t timeout) {
     response_len = 0;
     response_buffer[0] = '\0';
     response_complete = false;
+    flag_modem_brownout = false; // Reset flag
 
     for(int i=0; cmd[i]; i++) uart_poll_out(uart0, cmd[i]);
     uart_poll_out(uart0, '\r');
 
     int64_t start = k_uptime_get();
     while ((k_uptime_get() - start) < timeout.ticks) {
+        
+        // INSTANT FAIL ON BROWNOUT
+        if (flag_modem_brownout) {
+            printk(" -> MODEM RESET DETECTED!\n");
+            return false; 
+        }
+
         if (response_complete) {
             bool ok = (strstr(response_buffer, "OK") != NULL);
             printk(" -> %s\n", ok ? "OK" : "ERR");
@@ -252,43 +276,64 @@ machine_state_t run_idle(void) {
 }
 
 machine_state_t run_check_modem(void) {
-    printk("--- CHECK MODEM ---\n");
+    printk("--- CHECK MODEM (Strikes: %d/3) ---\n", consecutive_fails);
+    
+    if (consecutive_fails >= MAX_CONSECUTIVE_FAILS) {
+        printk("Strikes Exceeded -> FORCE HARD RESET\n");
+        return STATE_HARD_RESET;
+    }
+
     send_at("ATE0", K_MSEC(500)); 
     if (send_at("AT", K_MSEC(500))) return STATE_NET_SETUP;
+    
     printk("Modem Unresponsive -> HARD RESET\n");
     return STATE_HARD_RESET;
 }
 
 machine_state_t run_hard_reset(void) {
-    printk("--- HARD RESET ---\n");
+    printk("--- HARD RESET (%d/%d) ---\n", hard_reset_count + 1, MAX_HARD_RESETS);
+    
+    if (hard_reset_count >= MAX_HARD_RESETS) {
+        printk("CRITICAL FAILURE -> SYSTEM REBOOT\n");
+        k_sleep(K_SECONDS(2));
+        NVIC_SystemReset();
+    }
+
     gpio_pin_set_dt(&pwrkey_pin, 1);
     k_sleep(K_MSEC(PWRKEY_PRESS_MS));
     gpio_pin_set_dt(&pwrkey_pin, 0);
     
-    printk("Waiting for Boot (%ds)...\n", MODEM_BOOT_WAIT_SEC);
+    printk("Boot Wait (%ds)...\n", MODEM_BOOT_WAIT_SEC);
     for(int i=0; i<MODEM_BOOT_WAIT_SEC; i++) {
         k_sleep(K_SECONDS(1));
         watchdog_feed();
     }
-    if (send_at("AT", K_SECONDS(1))) return STATE_NET_SETUP;
+    
+    hard_reset_count++; 
+    consecutive_fails = 0; 
+    
+    if (send_at("AT", K_MSEC(500))) return STATE_NET_SETUP;
     return STATE_HARD_RESET;
 }
 
 machine_state_t run_net_setup(void) {
     printk("--- NET SETUP ---\n");
+    
     send_at("AT+CMEE=2", K_MSEC(500));
-    send_at("AT+CGREG=1", K_SECONDS(1));
-    if (send_at("AT+CPIN?", K_SECONDS(5))) {
+    send_at("AT+CGREG=1", K_MSEC(500));
+    
+    if (send_at("AT+CPIN?", K_MSEC(500))) {
         if (!strstr(response_buffer, "READY")) {
             printk("SIM Error\n");
             k_sleep(K_SECONDS(1));
         }
     }
+
     printk("Waiting for Reg...\n");
     bool registered = false;
     for(int i=0; i<20; i++) {
         if (flag_sbc_active) return STATE_SBC_OWNED;
-        if (send_at("AT+CGREG?", K_SECONDS(1))) {
+        if (send_at("AT+CGREG?", K_MSEC(500))) { 
             if (strstr(response_buffer, ",1") || strstr(response_buffer, ",5")) {
                 registered = true;
                 break;
@@ -298,18 +343,20 @@ machine_state_t run_net_setup(void) {
         watchdog_feed();
     }
     if (!registered) {
-        printk("Reg Timeout -> Hard Reset\n");
-        return STATE_HARD_RESET;
+        printk("Reg Timeout\n");
+        consecutive_fails++; 
+        return STATE_CHECK_MODEM;
     }
 
-    send_at("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"", K_SECONDS(2));
+    send_at("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"", K_MSEC(500));
     
-    if (!send_at("AT+CNACT=0,1", K_SECONDS(15))) {
-        send_at("AT+CNACT?", K_SECONDS(2));
+    if (!send_at("AT+CNACT=0,1", K_SECONDS(10))) {
+        send_at("AT+CNACT?", K_MSEC(500));
         if (strstr(response_buffer, "0,1")) {
             printk("Already Active\n");
         } else {
-            printk("Activation Failed -> Check Modem\n");
+            printk("Act Failed\n");
+            consecutive_fails++; 
             return STATE_CHECK_MODEM; 
         }
     }
@@ -319,12 +366,9 @@ machine_state_t run_net_setup(void) {
 machine_state_t run_https_setup(void) {
     printk("--- HTTPS SETUP ---\n");
     
-    // FIX: Allow SHDISC to fail (it fails if no session exists)
-    send_at("AT+SHDISC", K_SECONDS(2)); 
+    send_at("AT+SHDISC", K_MSEC(500)); 
     
-    // Upload Cert
-    if (!send_at("AT+CFSINIT", K_SECONDS(1))) goto setup_fail;
-    
+    send_at("AT+CFSINIT", K_MSEC(500));
     char cmd[64]; snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"%s\",0,%d,5000", CA_CERT_FILE, ca_certificate_length);
     uart_poll_out(uart0, '\r'); k_msleep(100);
     for(int i=0; cmd[i]; i++) uart_poll_out(uart0, cmd[i]);
@@ -332,60 +376,66 @@ machine_state_t run_https_setup(void) {
     k_msleep(500);
     for(int i=0; i<ca_certificate_length; i++) uart_poll_out(uart0, ca_certificate[i]);
     k_msleep(500);
-    
-    if (!send_at("AT+CFSTERM", K_SECONDS(1))) goto setup_fail;
+    send_at("AT+CFSTERM", K_MSEC(500));
     
     snprintf(cmd, sizeof(cmd), "AT+CSSLCFG=\"convert\",2,\"%s\"", CA_CERT_FILE);
-    send_at(cmd, K_SECONDS(3));
-    
-    send_at("AT+CSSLCFG=\"sslversion\",1,3", K_SECONDS(1));
-    send_at("AT+CSSLCFG=\"ignorertctime\",1,1", K_SECONDS(1));
-    
-    char sni[128];
-    snprintf(sni, sizeof(sni), "AT+CSSLCFG=\"sni\",1,\"%s\"", SERVER_HOST);
-    send_at(sni, K_SECONDS(1));
-
+    send_at(cmd, K_SECONDS(2));
+    send_at("AT+CSSLCFG=\"sslversion\",1,3", K_MSEC(500));
+    send_at("AT+CSSLCFG=\"ignorertctime\",1,1", K_MSEC(500));
+    char sni[128]; snprintf(sni, sizeof(sni), "AT+CSSLCFG=\"sni\",1,\"%s\"", SERVER_HOST);
+    send_at(sni, K_MSEC(500));
     char ssl[64]; snprintf(ssl, sizeof(ssl), "AT+SHSSL=1,\"%s\"", CA_CERT_FILE);
-    send_at(ssl, K_SECONDS(1));
-    
+    send_at(ssl, K_MSEC(500));
     char url[128]; snprintf(url, sizeof(url), "AT+SHCONF=\"URL\",\"%s\"", SERVER_URL);
-    send_at(url, K_SECONDS(1));
-    send_at("AT+SHCONF=\"BODYLEN\",1024", K_SECONDS(1));
-    send_at("AT+SHCONF=\"HEADERLEN\",350", K_SECONDS(1));
+    send_at(url, K_MSEC(500));
+    send_at("AT+SHCONF=\"BODYLEN\",1024", K_MSEC(500));
+    send_at("AT+SHCONF=\"HEADERLEN\",350", K_MSEC(500));
     
-    if (send_at("AT+SHCONN", K_SECONDS(60))) {
+    // Connect: 15s with Brownout Detect
+    if (send_at("AT+SHCONN", K_SECONDS(15))) {
         http_state.is_session_active = true;
+        consecutive_fails = 0;
+        hard_reset_count = 0;
         return STATE_POLLING;
     }
 
-setup_fail:
-    printk("HTTPS Setup Failed -> Retry in 5s\n");
-    k_sleep(K_SECONDS(5));
+    printk("HTTPS Fail -> Strike\n");
+    consecutive_fails++; 
+    
+    // RECOVERY DELAY: Give power rail time to stabilize
+    printk("Power Rail Recovery (5s)...\n");
+    k_sleep(K_SECONDS(5)); 
+    
     return STATE_CHECK_MODEM;
 }
 
 machine_state_t run_polling(void) {
-    if (!send_at("AT+SHCHEAD", K_SECONDS(2))) return STATE_CHECK_MODEM;
+    if (!send_at("AT+SHCHEAD", K_MSEC(500))) {
+         consecutive_fails++; 
+         return STATE_CHECK_MODEM;
+    }
     
-    send_at("AT+SHAHEAD=\"User-Agent\",\"nRF52-IoT\"", K_SECONDS(1));
-    
+    send_at("AT+SHAHEAD=\"User-Agent\",\"nRF52-IoT\"", K_MSEC(500));
     char req[64]; snprintf(req, sizeof(req), "AT+SHREQ=\"/api/poll/%s\",1", DEVICE_ID);
     http_state.last_status_code = 0;
     
-    if (send_at(req, K_SECONDS(30))) {
+    if (send_at(req, K_SECONDS(2))) {
         int64_t start = k_uptime_get();
         while (http_state.last_status_code == 0 && (k_uptime_get() - start) < 15000) {
              watchdog_feed();
              k_msleep(50);
         }
+        
         if (http_state.last_status_code == 200) {
+             consecutive_fails = 0; 
+             
              is_cmd_received = false;
              char read[32]; snprintf(read, sizeof(read), "AT+SHREAD=0,%d", http_state.last_data_size);
-             send_at(read, K_SECONDS(5));
+             send_at(read, K_SECONDS(2));
              if (is_cmd_received) {
                  execute_command(command_data);
                  snprintf(req, sizeof(req), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
-                 send_at(req, K_SECONDS(5));
+                 send_at(req, K_SECONDS(2));
              }
         }
     }
@@ -400,7 +450,7 @@ machine_state_t run_polling(void) {
 
 machine_state_t run_sbc_owned(void) {
     printk("--- SBC OWNED (SYSTEM OFF) ---\n");
-    send_at("AT+SHDISC", K_SECONDS(2));
+    send_at("AT+SHDISC", K_MSEC(500));
     nrf_gpio_cfg_sense_input(sbc_handoff.pin, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_LOW);
     gpio_pin_set_dt(&led0, 0);
     pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
