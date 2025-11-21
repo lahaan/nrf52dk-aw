@@ -1,11 +1,11 @@
-/* 
+/*
+    FSM-v2.0LPE 
+        unholy edition
+        *handoff x true deep sleep x https x fast setup x pwrkey x fallback (basic) x wdt (basic) x STABLE x UX logging 
+        TESTED - near v1.3-121125 functionality parity achieved* with -1200loc
+    21/11/2025    
+*/
 
-    v1.0-FSM INITIAL VERSION (experimental)
-    handoff works, recovery kinda kinda works, https works, wdt works but is kinda useless, sleep is kinda useless
-        needs: superior recovery, more testing, stat tracking, mem retention, proper sleep when sbc active, proper pwrkey usage, psm/edrx funcs
-    compared to 271025a (similar version): -400 lines of code, easier to understand
-
- */
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/device.h>
@@ -20,26 +20,23 @@
 
 // ---------------- CONFIGURATION ---------------- //
 
-// UART
 #define BAUD_RATE                   921600
 #define RX_BUF_SIZE                 128     
-#define RESPONSE_BUF_SIZE           1024
-#define RX_TIMEOUT_DELAY            500
+#define RESPONSE_BUF_SIZE           1024    
+#define RX_TIMEOUT_DELAY            500     
 
-// TIMING & PINS
-#define PWRKEY_HIGH_MS              1100
+// TIMING
+#define PWRKEY_PRESS_MS             1100
+#define MODEM_BOOT_WAIT_SEC         10
 #define POLL_INTERVAL_SEC           10
-#define WATCHDOG_TIMEOUT_MS         30000
-#define MODEM_BOOT_DELAY_SEC        12      
-#define MAX_POLL_FAILURES           3       // Reconnect after this many failed polls
 
 // SERVER
-#define SERVER_URL                  "seven080-mcu-backend.onrender.com"
 #define SERVER_HOST                 "seven080-mcu-backend.onrender.com"
+#define SERVER_URL                  "https://" SERVER_HOST
 #define DEVICE_ID                   "device001"
 #define CA_CERT_FILE                "server_ca.cer"
 
-// ---------------- HARDWARE REFERENCES ---------------- //
+// ---------------- HARDWARE ---------------- //
 
 const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0));
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -50,19 +47,19 @@ static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin
 static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
 static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 
-// ---------------- DATA STRUCTURES ---------------- //
+// ---------------- DATA ---------------- //
 
 typedef enum {
-    STATE_INIT,         
-    STATE_RECOVERY,     
-    STATE_HARD_RESET,   
-    STATE_NET_SETUP,    
-    STATE_HTTPS_SETUP,  
-    STATE_POLLING_ACTIVE,
-    STATE_POLLING_IDLE,
+    STATE_BOOT_WAIT,
+    STATE_IDLE,
+    STATE_INIT,
+    STATE_CHECK_MODEM,
+    STATE_NET_SETUP,
+    STATE_HTTPS_SETUP,
+    STATE_POLLING,
     STATE_SBC_OWNED,
-    STATE_SBC_RECLAIM,
-    STATE_SYSTEM_OFF
+    STATE_RECOVERY,
+    STATE_HARD_RESET
 } machine_state_t;
 
 typedef struct {
@@ -70,47 +67,26 @@ typedef struct {
     bool is_session_active;
     int last_status_code;
     int last_data_size;
-    bool is_shreq_received; 
 } http_state_t;
 
-typedef struct {
-    bool is_certificate_setup;
-    bool is_response_complete;
-    size_t response_length;
-} uart_state_t;
+static http_state_t http_state;
 
-typedef struct {
-    uint32_t boot_count;
-    uint32_t reset_reason;
-    uint32_t handoff_count;
-    uint32_t https_fail_count; 
-    uint32_t poll_fail_count; // Track consecutive poll failures
-} device_stats_t;
-
-// ---------------- GLOBAL STATE ---------------- //
-
-static __attribute__((section(".noinit"))) http_state_t http_state;
-static __attribute__((section(".noinit"))) uart_state_t uart_state;
-static __attribute__((section(".noinit"))) device_stats_t stats;
-
-static int wdt_channel_id;
+// GLOBALS
+static machine_state_t current_state = STATE_BOOT_WAIT;
+static int wdt_channel_id = -1;
 static bool is_skip_wdt = false;
+static bool flag_start_network = false;
+static bool flag_sbc_active = false;
 
-// BUFFERS
-static uint8_t rx_ping[RX_BUF_SIZE];
-static uint8_t rx_pong[RX_BUF_SIZE];
+// UART
+static uint8_t rx_buf[RX_BUF_SIZE];
 static char response_buffer[RESPONSE_BUF_SIZE];
+static size_t response_len = 0;
+static bool response_complete = false;
 static char command_data[256];
-static bool is_command_received = false;
+static bool is_cmd_received = false;
 
-// FSM Globals
-static machine_state_t current_state = STATE_INIT;
-static volatile bool flag_sbc_request_active = false;
-static struct gpio_callback sbc_handoff_cb_data;
-static struct gpio_callback button_callback_data;
-static struct gpio_callback button3_callback_data;
-
-// CERTIFICATE DATA
+// CERT
 const char ca_certificate[] = 
 "-----BEGIN CERTIFICATE-----\n"
 "MIIDejCCAmKgAwIBAgIQf+UwvzMTQ77dghYQST2KGzANBgkqhkiG9w0BAQsFADBX\n"
@@ -136,611 +112,387 @@ const char ca_certificate[] =
 const size_t ca_certificate_length = sizeof(ca_certificate) - 1;
 
 // ---------------- FORWARD DECLARATIONS ---------------- //
-
 static void watchdog_feed(void);
 static void watchdog_init(void);
-static bool send_at_power_safe(const char *cmd, k_timeout_t timeout, int recharge_ms);
-void execute_command(const char *command, int pin, const char *data);
-void cleanup_http_session(void);
-void send_raw(const char *command);
 
 // ---------------- UART PROCESSING ---------------- //
 
-static void parse_accumulated_response(void)
-{
-    if (strstr(response_buffer, "+SHREQ:")) {
-        char *ptr = strstr(response_buffer, "+SHREQ:");
-        char *comma1 = strchr(ptr, ',');
-        if (comma1) {
-            char *comma2 = strchr(comma1 + 1, ',');
-            if (comma2) {
-                http_state.last_status_code = atoi(comma1 + 1);
-                http_state.last_data_size = atoi(comma2 + 1);
-            }
-        }
-    }
-    
-    if (strstr(response_buffer, "+SHSTATE:")) {
-        http_state.is_session_active = (strstr(response_buffer, "+SHSTATE: 1") != NULL);
-    }
-
-    if (strstr(response_buffer, "CMD:") && !is_command_received) {
-        char *cmd_start = strstr(response_buffer, "CMD:");
-        if (strlen(cmd_start) < sizeof(command_data)) {
-            strncpy(command_data, cmd_start, sizeof(command_data) - 1);
-            char *end = strstr(command_data, "\r");
-            if (end) *end = '\0';
-            is_command_received = true;
-            printk("Command Data Captured: %s\n", command_data);
-        }
-    }
-}
-
-static void uart_event_callback(const struct device *dev, struct uart_event *event, void *user_data)
-{
-    switch (event->type) {
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data) {
+    switch (evt->type) {
     case UART_RX_RDY: {
-        const uint8_t *p = event->data.rx.buf + event->data.rx.offset;
-        size_t len = event->data.rx.len;
-
-        for (size_t i = 0; i < len; i++) {
-            if (uart_state.response_length < RESPONSE_BUF_SIZE - 1) {
-                response_buffer[uart_state.response_length++] = (char)p[i];
-                response_buffer[uart_state.response_length] = '\0';
+        for (int i = 0; i < evt->data.rx.len; i++) {
+            char c = evt->data.rx.buf[evt->data.rx.offset + i];
+            if (response_len < RESPONSE_BUF_SIZE - 1) {
+                response_buffer[response_len++] = c;
+                response_buffer[response_len] = '\0';
             }
         }
-
-        if (strstr(response_buffer, "OK") || 
+        if (strstr(response_buffer, "OK\r\n") || 
             strstr(response_buffer, "ERROR") || 
             strstr(response_buffer, "+CME ERROR")) {
-            parse_accumulated_response();
-            uart_state.is_response_complete = true;
+            response_complete = true;
         }
-        else if (strstr(response_buffer, "+SHREQ:")) {
-            parse_accumulated_response();
+        if (strstr(response_buffer, "+SHREQ:")) {
+            char *p = strstr(response_buffer, "+SHREQ:");
+            sscanf(p, "+SHREQ: \"%*[^\"]\",%d,%d", &http_state.last_status_code, &http_state.last_data_size);
+            if (http_state.last_status_code == 0) {
+                char *c1 = strchr(p, ',');
+                if (c1) {
+                    http_state.last_status_code = atoi(c1+1);
+                    char *c2 = strchr(c1+1, ',');
+                    if (c2) http_state.last_data_size = atoi(c2+1);
+                }
+            }
+        }
+        if (strstr(response_buffer, "CMD:")) {
+            char *start = strstr(response_buffer, "CMD:");
+            strncpy(command_data, start, sizeof(command_data)-1);
+            is_cmd_received = true;
         }
         break;
     }
-
-    case UART_RX_BUF_REQUEST:
-        {
-            uint8_t *next_buf = (event->data.rx_buf.buf == rx_ping) ? rx_pong : rx_ping;
-            uart_rx_buf_rsp(uart0, next_buf, RX_BUF_SIZE);
-        }
-        break;
-
-    case UART_RX_BUF_RELEASED:
-    case UART_RX_STOPPED:
-        break;
-
     case UART_RX_DISABLED:
-        uart_rx_enable(uart0, rx_ping, RX_BUF_SIZE, RX_TIMEOUT_DELAY);
+        uart_rx_enable(uart0, rx_buf, RX_BUF_SIZE, RX_TIMEOUT_DELAY);
         break;
-
-    default:
-        break;
+    default: break;
     }
 }
 
-// ---------------- AT COMMAND PRIMITIVES ---------------- //
+// ---------------- PRIMITIVES ---------------- //
 
-void send_raw(const char *command) {
-    printk(">>> %s\n", command);
-    uart_state.response_length = 0;
+bool send_at(const char *cmd, k_timeout_t timeout) {
+    printk("> %s", cmd);
+    response_len = 0;
     response_buffer[0] = '\0';
-    uart_state.is_response_complete = false;
-    
-    for (int i = 0; command[i] != '\0'; i++) uart_poll_out(uart0, command[i]);
+    response_complete = false;
+
+    for(int i=0; cmd[i]; i++) uart_poll_out(uart0, cmd[i]);
     uart_poll_out(uart0, '\r');
-}
-
-static bool send_at_power_safe(const char *cmd, k_timeout_t timeout, int recharge_ms) {
-    if (flag_sbc_request_active) return false;
-    if (recharge_ms > 0) k_msleep(recharge_ms);
-
-    send_raw(cmd);
 
     int64_t start = k_uptime_get();
-    int64_t last_print = start;
-
     while ((k_uptime_get() - start) < timeout.ticks) {
-        if (flag_sbc_request_active) return false;
-
-        if (uart_state.is_response_complete) {
-             printk("RX: %s\n", response_buffer);
-             if (strstr(response_buffer, "OK")) return true;
-             if (strstr(response_buffer, "ERROR")) return false;
-             return true; 
+        if (response_complete) {
+            bool ok = (strstr(response_buffer, "OK") != NULL);
+            printk(" -> %s\n", ok ? "OK" : "ERR");
+            return ok;
         }
-        
-        if (k_uptime_get() - last_print > 2000) {
-            printk("."); 
-            last_print = k_uptime_get();
-        }
-        
         watchdog_feed();
+        if (flag_sbc_active) return false;
         k_msleep(10);
     }
-    printk("\nTIMEOUT on %s\n", cmd);
+    printk(" -> TIMEOUT\n");
     return false;
 }
 
-// ---------------- COMMAND LOGIC ---------------- //
-
-void execute_command(const char *command, int pin, const char *data)
-{
-    printk("EXECUTING: %s PIN:%d DATA:%s\n", command, pin, data);
+void execute_command(const char *raw) {
+    char cmd[16] = {0}; int pin = 0; char arg[32] = {0};
+    char *p_cmd = strstr(raw, "CMD:");
+    char *p_pin = strstr(raw, "PIN:");
+    char *p_dat = strstr(raw, "DATA:");
     
-    if (strcmp(command, "LED_ON") == 0 && gpio_is_ready_dt(&led0)) {
-        gpio_pin_set_dt(&led0, 1);
-    }
-    else if (strcmp(command, "LED_OFF") == 0 && gpio_is_ready_dt(&led0)) {
-        gpio_pin_set_dt(&led0, 0);
-    }
-    else if (strcmp(command, "TOGGLE") == 0 && gpio_is_ready_dt(&led0)) {
-        gpio_pin_toggle_dt(&led0);
-    }
-    else if (strcmp(command, "BOOT") == 0 && gpio_is_ready_dt(&trigger_pin)) {
-        gpio_pin_set_dt(&trigger_pin, 0);
-        k_sleep(K_MSEC(250));
-        gpio_pin_set_dt(&trigger_pin, 1);
-        flag_sbc_request_active = true;
-    }
-    else if (strcmp(command, "PULSE") == 0 && pin == 11) {
-        gpio_pin_set_dt(&trigger_pin, 0);
-        k_sleep(K_MSEC(500));
-        gpio_pin_set_dt(&trigger_pin, 1);
+    if (p_cmd) sscanf(p_cmd, "CMD:%15[^,]", cmd);
+    if (p_pin) sscanf(p_pin, "PIN:%d", &pin);
+    if (p_dat) sscanf(p_dat, "DATA:%31s", arg);
+
+    printk("EXEC: %s\n", cmd);
+
+    if (strcmp(cmd, "LED_ON") == 0) gpio_pin_set_dt(&led0, 1);
+    else if (strcmp(cmd, "LED_OFF") == 0) gpio_pin_set_dt(&led0, 0);
+    else if (strcmp(cmd, "TOGGLE") == 0) gpio_pin_toggle_dt(&led0);
+    else if (strcmp(cmd, "BOOT") == 0) {
+        printk("Booting SBC...\n");
+        gpio_pin_set_dt(&trigger_pin, 0); 
+        k_msleep(250);
+        gpio_pin_set_dt(&trigger_pin, 1); 
+        current_state = STATE_SBC_OWNED;
     }
 }
 
-void process_command_string(const char *response)
-{
-    if (strstr(response, "NOCMD")) return;
-    char command[32] = {0};
-    int pin = 0;
-    char data[64] = {0};
-    if (sscanf(response, "CMD:%31[^,],PIN:%d,DATA:%63s", command, &pin, data) == 3) {
-        execute_command(command, pin, data);
+// ---------------- FSM STATES ---------------- //
+
+machine_state_t run_boot_wait(void) {
+    printk("--- BOOT WAIT (3s) ---\n");
+    gpio_pin_set_dt(&led0, 1);
+    for(int i=0; i<30; i++) {
+        if (gpio_pin_get_dt(&button3) == 1) {
+            is_skip_wdt = true;
+            printk("WDT DISABLED\n");
+            for(int k=0; k<5; k++) { gpio_pin_toggle_dt(&led0); k_msleep(50); }
+        }
+        k_msleep(100);
     }
-}
-
-// ---------------- FSM STATE FUNCTIONS ---------------- //
-
-void cleanup_http_session(void) {
-    send_at_power_safe("AT+SHDISC", K_SECONDS(2), 100);
-    send_at_power_safe("AT+SHSSL=0", K_SECONDS(1), 100);
-    http_state.is_session_active = false;
-    http_state.is_connected = false;
+    gpio_pin_set_dt(&led0, 0);
+    return STATE_INIT;
 }
 
 machine_state_t run_init(void) {
-    printk("--- STATE: INIT ---\n");
-    printk("Reset Reason: 0x%08X\n", stats.reset_reason);
-    stats.https_fail_count = 0; 
-
-    if ((stats.reset_reason & NRF_POWER_RESETREAS_DOG_MASK) || 
-        (stats.reset_reason & NRF_POWER_RESETREAS_SREQ_MASK)) {
-        printk("Detected Crash/Soft Reset. Attempting Recovery...\n");
+    uint32_t rr = nrf_power_resetreas_get(NRF_POWER);
+    nrf_power_resetreas_clear(NRF_POWER, 0xFFFFFFFF);
+    
+    if (rr & NRF_POWER_RESETREAS_OFF_MASK) {
+        printk("Wake from Sleep -> RECOVERY\n");
         return STATE_RECOVERY;
     }
-
-    printk("Cold Boot. Assuming Modem needs Start.\n");
-    return STATE_HARD_RESET; 
+    if (rr & NRF_POWER_RESETREAS_DOG_MASK) {
+        printk("WDT Reset -> CHECK MODEM\n");
+        return STATE_CHECK_MODEM; 
+    }
+    printk("Cold Boot -> IDLE\n");
+    return STATE_IDLE;
 }
 
-machine_state_t run_recovery(void) {
-    printk("--- STATE: RECOVERY ---\n");
-    
-    printk("Sending +++...\n");
-    k_sleep(K_MSEC(1100));
-    uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(20));
-    uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(20));
-    uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(2000)); 
-
-    if (send_at_power_safe("AT", K_SECONDS(1), 0)) {
-        printk("Modem Recovered via Escape/AT.\n");
-        return STATE_NET_SETUP;
+machine_state_t run_idle(void) {
+    if (flag_start_network) {
+        flag_start_network = false;
+        return STATE_CHECK_MODEM;
     }
+    k_msleep(100);
+    watchdog_feed();
+    return STATE_IDLE;
+}
 
+machine_state_t run_check_modem(void) {
+    printk("--- CHECK MODEM ---\n");
+    send_at("ATE0", K_MSEC(500)); 
+    if (send_at("AT", K_MSEC(500))) return STATE_NET_SETUP;
+    printk("Modem Unresponsive -> HARD RESET\n");
     return STATE_HARD_RESET;
 }
 
 machine_state_t run_hard_reset(void) {
-    printk("--- STATE: HARD RESET ---\n");
-    if (!gpio_is_ready_dt(&pwrkey_pin)) return STATE_HARD_RESET;
-
-    stats.https_fail_count = 0; 
-    stats.poll_fail_count = 0;
-
-    for (int i=0; i<3; i++) {
-        if (send_at_power_safe("AT", K_MSEC(500), 100)) {
-            printk("Modem is ALIVE, skipping PWRKEY toggle.\n");
-            return STATE_NET_SETUP;
-        }
-    }
-
-    printk("Modem Unresponsive - Toggling PWRKEY (Attempt 1)...\n");
-
+    printk("--- HARD RESET ---\n");
     gpio_pin_set_dt(&pwrkey_pin, 1);
-    k_sleep(K_MSEC(PWRKEY_HIGH_MS));
+    k_sleep(K_MSEC(PWRKEY_PRESS_MS));
     gpio_pin_set_dt(&pwrkey_pin, 0);
     
-    printk("Waiting %ds for boot...\n", MODEM_BOOT_DELAY_SEC);
-    for(int i=0; i<MODEM_BOOT_DELAY_SEC; i++) {
+    printk("Waiting for Boot (%ds)...\n", MODEM_BOOT_WAIT_SEC);
+    for(int i=0; i<MODEM_BOOT_WAIT_SEC; i++) {
         k_sleep(K_SECONDS(1));
         watchdog_feed();
-        if (i > 4) send_raw("AT"); 
     }
-
-    if (send_at_power_safe("AT", K_SECONDS(2), 0)) {
-        return STATE_NET_SETUP;
-    }
-
-    printk("Still dead. Toggling PWRKEY (Attempt 2)...\n");
-    gpio_pin_set_dt(&pwrkey_pin, 1);
-    k_sleep(K_MSEC(PWRKEY_HIGH_MS));
-    gpio_pin_set_dt(&pwrkey_pin, 0);
-    
-    printk("Waiting %ds for boot...\n", MODEM_BOOT_DELAY_SEC);
-    for(int i=0; i<MODEM_BOOT_DELAY_SEC; i++) {
-        k_sleep(K_SECONDS(1));
-        watchdog_feed();
-        if (i > 4) send_raw("AT");
-    }
-
-    if (send_at_power_safe("AT", K_SECONDS(2), 0)) {
-        return STATE_NET_SETUP;
-    }
-
-    printk("CRITICAL: Modem dead after 2 toggles. Triggering System Reset via WDT.\n");
-    while(1) {
-        k_sleep(K_SECONDS(1));
-    }
+    if (send_at("AT", K_SECONDS(1))) return STATE_NET_SETUP;
     return STATE_HARD_RESET;
 }
 
 machine_state_t run_net_setup(void) {
-    printk("--- STATE: NET SETUP ---\n");
-
-    send_at_power_safe("ATE0", K_SECONDS(1), 0);
-    send_at_power_safe("AT+CMEE=2", K_SECONDS(1), 0);
-    send_at_power_safe("AT+CGREG=1", K_SECONDS(1), 0);
-    
-    send_at_power_safe("AT+CGREG?", K_SECONDS(1), 0);
-    if (strstr(response_buffer, "1,1") || strstr(response_buffer, "1,5")) {
-        return STATE_HTTPS_SETUP;
+    printk("--- NET SETUP ---\n");
+    send_at("AT+CMEE=2", K_MSEC(500));
+    send_at("AT+CGREG=1", K_SECONDS(1));
+    if (send_at("AT+CPIN?", K_SECONDS(5))) {
+        if (!strstr(response_buffer, "READY")) {
+            printk("SIM Error\n");
+            k_sleep(K_SECONDS(1));
+        }
     }
-
-    if (!send_at_power_safe("AT+CFUN=1", K_SECONDS(10), 1000)) return STATE_HARD_RESET;
-    if (!send_at_power_safe("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"", K_SECONDS(2), 500)) return STATE_HARD_RESET;
-    
-    send_at_power_safe("AT+CNACT?", K_SECONDS(1), 0);
-    if (!strstr(response_buffer, "0,1")) {
-        send_at_power_safe("AT+CNACT=0,1", K_SECONDS(15), 1000);
-    }
-
-    for(int i=0; i<40; i++) {
-        if (flag_sbc_request_active) return STATE_SBC_OWNED;
-        
-        send_at_power_safe("AT+CGREG?", K_SECONDS(1), 0);
-        if (strstr(response_buffer, "1,1") || strstr(response_buffer, "1,5")) {
-            http_state.is_connected = true;
-            return STATE_HTTPS_SETUP;
+    printk("Waiting for Reg...\n");
+    bool registered = false;
+    for(int i=0; i<20; i++) {
+        if (flag_sbc_active) return STATE_SBC_OWNED;
+        if (send_at("AT+CGREG?", K_SECONDS(1))) {
+            if (strstr(response_buffer, ",1") || strstr(response_buffer, ",5")) {
+                registered = true;
+                break;
+            }
         }
         k_sleep(K_SECONDS(2));
+        watchdog_feed();
     }
-
-    return STATE_HARD_RESET;
-}
-
-machine_state_t run_https_setup(void) {
-    printk("--- STATE: HTTPS SETUP ---\n");
-    
-    send_at_power_safe("AT+SHDISC", K_SECONDS(2), 0);
-    
-    send_at_power_safe("AT+CNACT?", K_SECONDS(1), 0);
-    if (!strstr(response_buffer, "0,1")) {
-         send_at_power_safe("AT+CNACT=0,1", K_SECONDS(5), 500);
-    }
-
-    send_at_power_safe("AT+CSSLCFG=\"ignorertctime\",1,1", K_SECONDS(1), 0);
-    send_at_power_safe("AT+CSSLCFG=\"sslversion\",1,3", K_SECONDS(1), 0);
-    char sni[128]; snprintf(sni, sizeof(sni), "AT+CSSLCFG=\"sni\",1,\"%s\"", SERVER_HOST);
-    send_at_power_safe(sni, K_SECONDS(1), 0);
-
-    if (!uart_state.is_certificate_setup) {
-        send_at_power_safe("AT+CFSINIT", K_SECONDS(1), 0);
-        char cmd[64]; snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"%s\",0,%d,10000", CA_CERT_FILE, (int)ca_certificate_length);
-        send_raw(cmd);
-        k_sleep(K_MSEC(500));
-        
-        for(size_t i=0; i<ca_certificate_length; i++) {
-            uart_poll_out(uart0, ca_certificate[i]);
-            if (i % 50 == 0) watchdog_feed();
-        }
-        
-        k_sleep(K_SECONDS(1));
-        send_at_power_safe("AT+CFSTERM", K_SECONDS(1), 0);
-        snprintf(cmd, sizeof(cmd), "AT+CSSLCFG=\"convert\",2,\"%s\"", CA_CERT_FILE);
-        send_at_power_safe(cmd, K_SECONDS(5), 1000);
-        uart_state.is_certificate_setup = true;
-    }
-
-    char ssl[64]; snprintf(ssl, sizeof(ssl), "AT+SHSSL=1,\"%s\"", CA_CERT_FILE);
-    send_at_power_safe(ssl, K_SECONDS(1), 0);
-    char url[128]; snprintf(url, sizeof(url), "AT+SHCONF=\"URL\",\"https://%s\"", SERVER_URL);
-    send_at_power_safe(url, K_SECONDS(1), 0);
-    send_at_power_safe("AT+SHCONF=\"BODYLEN\",1024", K_SECONDS(1), 0);
-    send_at_power_safe("AT+SHCONF=\"HEADERLEN\",350", K_SECONDS(1), 0);
-
-    if (send_at_power_safe("AT+SHCONN", K_SECONDS(60), 2000)) {
-        http_state.is_session_active = true;
-        stats.https_fail_count = 0;
-        stats.poll_fail_count = 0;
-        return STATE_POLLING_ACTIVE;
-    }
-
-    stats.https_fail_count++;
-    printk("HTTPS Setup Failed (%d/3)\n", stats.https_fail_count);
-    
-    if (stats.https_fail_count >= 3) {
-        printk("Too many HTTPS failures. Forcing Hard Reset.\n");
+    if (!registered) {
+        printk("Reg Timeout -> Hard Reset\n");
         return STATE_HARD_RESET;
     }
 
-    return STATE_NET_SETUP;
+    send_at("AT+CGDCONT=1,\"IP\",\"internet.telia.ee\"", K_SECONDS(2));
+    
+    if (!send_at("AT+CNACT=0,1", K_SECONDS(15))) {
+        send_at("AT+CNACT?", K_SECONDS(2));
+        if (strstr(response_buffer, "0,1")) {
+            printk("Already Active\n");
+        } else {
+            printk("Activation Failed -> Check Modem\n");
+            return STATE_CHECK_MODEM; 
+        }
+    }
+    return STATE_HTTPS_SETUP;
 }
 
-machine_state_t run_polling_active(void) {
-    printk("--- STATE: POLLING ---\n");
-
-    if (!http_state.is_session_active) return STATE_HTTPS_SETUP;
-
-    http_state.last_status_code = 0;
-    http_state.last_data_size = 0;
-
-    send_at_power_safe("AT+SHCHEAD", K_SECONDS(1), 0);
-    send_at_power_safe("AT+SHAHEAD=\"User-Agent\",\"nRF52-IoT\"", K_SECONDS(1), 0);
-    send_at_power_safe("AT+SHAHEAD=\"Connection\",\"keep-alive\"", K_SECONDS(1), 0);
-
-    char get_cmd[128]; snprintf(get_cmd, sizeof(get_cmd), "AT+SHREQ=\"/api/poll/%s\",1", DEVICE_ID);
+machine_state_t run_https_setup(void) {
+    printk("--- HTTPS SETUP ---\n");
     
-    if (!send_at_power_safe(get_cmd, K_SECONDS(30), 500)) {
-        stats.poll_fail_count++;
-        printk("Poll CMD Timeout (%d/%d)\n", stats.poll_fail_count, MAX_POLL_FAILURES);
-        
-        if (stats.poll_fail_count >= MAX_POLL_FAILURES) {
-            printk("Polling died. Rebuilding HTTPS.\n");
-            return STATE_HTTPS_SETUP;
-        }
-        return STATE_POLLING_IDLE;
+    // FIX: Allow SHDISC to fail (it fails if no session exists)
+    send_at("AT+SHDISC", K_SECONDS(2)); 
+    
+    // Upload Cert
+    if (!send_at("AT+CFSINIT", K_SECONDS(1))) goto setup_fail;
+    
+    char cmd[64]; snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"%s\",0,%d,5000", CA_CERT_FILE, ca_certificate_length);
+    uart_poll_out(uart0, '\r'); k_msleep(100);
+    for(int i=0; cmd[i]; i++) uart_poll_out(uart0, cmd[i]);
+    uart_poll_out(uart0, '\r');
+    k_msleep(500);
+    for(int i=0; i<ca_certificate_length; i++) uart_poll_out(uart0, ca_certificate[i]);
+    k_msleep(500);
+    
+    if (!send_at("AT+CFSTERM", K_SECONDS(1))) goto setup_fail;
+    
+    snprintf(cmd, sizeof(cmd), "AT+CSSLCFG=\"convert\",2,\"%s\"", CA_CERT_FILE);
+    send_at(cmd, K_SECONDS(3));
+    
+    send_at("AT+CSSLCFG=\"sslversion\",1,3", K_SECONDS(1));
+    send_at("AT+CSSLCFG=\"ignorertctime\",1,1", K_SECONDS(1));
+    
+    char sni[128];
+    snprintf(sni, sizeof(sni), "AT+CSSLCFG=\"sni\",1,\"%s\"", SERVER_HOST);
+    send_at(sni, K_SECONDS(1));
+
+    char ssl[64]; snprintf(ssl, sizeof(ssl), "AT+SHSSL=1,\"%s\"", CA_CERT_FILE);
+    send_at(ssl, K_SECONDS(1));
+    
+    char url[128]; snprintf(url, sizeof(url), "AT+SHCONF=\"URL\",\"%s\"", SERVER_URL);
+    send_at(url, K_SECONDS(1));
+    send_at("AT+SHCONF=\"BODYLEN\",1024", K_SECONDS(1));
+    send_at("AT+SHCONF=\"HEADERLEN\",350", K_SECONDS(1));
+    
+    if (send_at("AT+SHCONN", K_SECONDS(60))) {
+        http_state.is_session_active = true;
+        return STATE_POLLING;
     }
 
-    int64_t start = k_uptime_get();
-    while (!http_state.last_status_code && (k_uptime_get() - start) < K_SECONDS(15).ticks) {
-        if (flag_sbc_request_active) return STATE_SBC_OWNED;
+setup_fail:
+    printk("HTTPS Setup Failed -> Retry in 5s\n");
+    k_sleep(K_SECONDS(5));
+    return STATE_CHECK_MODEM;
+}
+
+machine_state_t run_polling(void) {
+    if (!send_at("AT+SHCHEAD", K_SECONDS(2))) return STATE_CHECK_MODEM;
+    
+    send_at("AT+SHAHEAD=\"User-Agent\",\"nRF52-IoT\"", K_SECONDS(1));
+    
+    char req[64]; snprintf(req, sizeof(req), "AT+SHREQ=\"/api/poll/%s\",1", DEVICE_ID);
+    http_state.last_status_code = 0;
+    
+    if (send_at(req, K_SECONDS(30))) {
+        int64_t start = k_uptime_get();
+        while (http_state.last_status_code == 0 && (k_uptime_get() - start) < 15000) {
+             watchdog_feed();
+             k_msleep(50);
+        }
+        if (http_state.last_status_code == 200) {
+             is_cmd_received = false;
+             char read[32]; snprintf(read, sizeof(read), "AT+SHREAD=0,%d", http_state.last_data_size);
+             send_at(read, K_SECONDS(5));
+             if (is_cmd_received) {
+                 execute_command(command_data);
+                 snprintf(req, sizeof(req), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
+                 send_at(req, K_SECONDS(5));
+             }
+        }
+    }
+    
+    for(int i=0; i<POLL_INTERVAL_SEC * 10; i++) {
+        if (flag_sbc_active) return STATE_SBC_OWNED;
+        k_msleep(100);
         watchdog_feed();
-        k_msleep(50);
     }
-
-    if (http_state.last_status_code == 200 && http_state.last_data_size > 0) {
-        // Successful Poll - Reset Fail Counter
-        stats.poll_fail_count = 0;
-        
-        is_command_received = false;
-        char read_cmd[64]; snprintf(read_cmd, sizeof(read_cmd), "AT+SHREAD=0,%d", http_state.last_data_size);
-        send_at_power_safe(read_cmd, K_SECONDS(5), 0);
-
-        if (is_command_received) {
-            process_command_string(command_data);
-            http_state.last_status_code = 0;
-            
-            snprintf(get_cmd, sizeof(get_cmd), "AT+SHREQ=\"/api/ack/%s/OK\",1", DEVICE_ID);
-            send_at_power_safe(get_cmd, K_SECONDS(10), 1000);
-            
-            // Synchronize ACK URC
-            int64_t ack_start = k_uptime_get();
-            while (!http_state.last_status_code && (k_uptime_get() - ack_start) < K_SECONDS(5).ticks) {
-                 watchdog_feed();
-                 k_msleep(50);
-            }
-            http_state.last_status_code = 0;
-        }
-    }
-    // Handle non-200 responses
-    else if (http_state.last_status_code != 0 && http_state.last_status_code != 200) {
-         stats.poll_fail_count++;
-         printk("HTTP Error %d. Fail Count: %d\n", http_state.last_status_code, stats.poll_fail_count);
-         if (stats.poll_fail_count >= MAX_POLL_FAILURES) return STATE_HTTPS_SETUP;
-    }
-
-    http_state.last_status_code = 0;
-    return STATE_POLLING_IDLE;
+    return STATE_POLLING;
 }
 
-machine_state_t run_sbc_reclaim(void) {
-    printk("--- STATE: SBC RECLAIM ---\n");
-    stats.handoff_count++;
+machine_state_t run_sbc_owned(void) {
+    printk("--- SBC OWNED (SYSTEM OFF) ---\n");
+    send_at("AT+SHDISC", K_SECONDS(2));
+    nrf_gpio_cfg_sense_input(sbc_handoff.pin, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_LOW);
+    gpio_pin_set_dt(&led0, 0);
+    pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
+    nrf_power_system_off(NRF_POWER);
+    return STATE_RECOVERY; 
+}
 
-    k_sleep(K_SECONDS(2));
+machine_state_t run_recovery(void) {
+    printk("--- RECOVERY ---\n");
+    k_sleep(K_MSEC(1000));
+    uart_poll_out(uart0, '+'); k_sleep(K_MSEC(20));
+    uart_poll_out(uart0, '+'); k_sleep(K_MSEC(20));
+    uart_poll_out(uart0, '+'); k_sleep(K_MSEC(1000));
+    send_at("ATH", K_SECONDS(2));
+    return STATE_CHECK_MODEM;
+}
+
+// ---------------- MAIN ---------------- //
+
+void button_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    flag_start_network = true;
+}
+void sbc_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    if (gpio_pin_get_dt(&sbc_handoff) == 1) flag_sbc_active = true;
+}
+
+int main(void) {
+    if (gpio_is_ready_dt(&trigger_pin)) {
+        gpio_pin_configure_dt(&trigger_pin, GPIO_OUTPUT_ACTIVE);
+    }
+    if (gpio_is_ready_dt(&led0)) gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
+    if (gpio_is_ready_dt(&pwrkey_pin)) gpio_pin_configure_dt(&pwrkey_pin, GPIO_OUTPUT_INACTIVE);
     
-    printk("Escaping PPP...\n");
-    uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(20));
-    uart_poll_out(uart0, '+');
-    k_sleep(K_MSEC(20));
-    uart_poll_out(uart0, '+');
-    k_sleep(K_SECONDS(2));
-
-    send_at_power_safe("ATH", K_SECONDS(2), 0);
-
-    if (send_at_power_safe("AT", K_SECONDS(2), 0)) {
-        return STATE_NET_SETUP;
+    if (gpio_is_ready_dt(&button)) {
+        gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
+        gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+        static struct gpio_callback btn_cb;
+        gpio_init_callback(&btn_cb, button_cb, BIT(button.pin));
+        gpio_add_callback(button.port, &btn_cb);
+    }
+    if (gpio_is_ready_dt(&button3)) gpio_pin_configure_dt(&button3, GPIO_INPUT | GPIO_PULL_UP);
+    
+    if (gpio_is_ready_dt(&sbc_handoff)) {
+        gpio_pin_configure_dt(&sbc_handoff, GPIO_INPUT);
+        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_BOTH);
+        static struct gpio_callback sbc_data;
+        gpio_init_callback(&sbc_data, sbc_cb, BIT(sbc_handoff.pin));
+        gpio_add_callback(sbc_handoff.port, &sbc_data);
+        if (gpio_pin_get_dt(&sbc_handoff) == 1) flag_sbc_active = true;
     }
 
-    return STATE_HARD_RESET;
-}
+    uart_callback_set(uart0, uart_cb, NULL);
+    uart_rx_enable(uart0, rx_buf, RX_BUF_SIZE, RX_TIMEOUT_DELAY);
 
-// ---------------- INTERRUPTS ---------------- //
+    while(1) {
+        if (flag_sbc_active && current_state != STATE_SBC_OWNED && current_state != STATE_BOOT_WAIT) {
+            current_state = STATE_SBC_OWNED;
+        }
 
-static void sbc_handoff_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
-{
-    // Simply flag that the pin is High. 
-    // We do not clear it here; State logic handles clearing.
-    if (gpio_pin_get_dt(&sbc_handoff) == 1) {
-        flag_sbc_request_active = true;
+        switch(current_state) {
+            case STATE_BOOT_WAIT:   current_state = run_boot_wait(); break;
+            case STATE_IDLE:        current_state = run_idle(); break;
+            case STATE_INIT:        current_state = run_init(); break;
+            case STATE_CHECK_MODEM: current_state = run_check_modem(); break;
+            case STATE_NET_SETUP:   current_state = run_net_setup(); break;
+            case STATE_HTTPS_SETUP: current_state = run_https_setup(); break;
+            case STATE_POLLING:     current_state = run_polling(); break;
+            case STATE_SBC_OWNED:   current_state = run_sbc_owned(); break;
+            case STATE_RECOVERY:    current_state = run_recovery(); break;
+            case STATE_HARD_RESET:  current_state = run_hard_reset(); break;
+        }
+        
+        if (!is_skip_wdt && wdt_channel_id == -1 && current_state != STATE_BOOT_WAIT) {
+            watchdog_init();
+        }
+        watchdog_feed();
     }
+    return 0;
 }
-
-static void button_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
-{
-    printk("Button pressed\n");
-}
-
-static void button3_pressed_callback(const struct device *dev, struct gpio_callback *callback, uint32_t pins)
-{
-    is_skip_wdt = true;
-    printk("WDT Disable Requested\n");
-}
-
-// ---------------- WATCHDOG ---------------- //
 
 static void watchdog_init(void) {
     if (is_skip_wdt) return;
     struct wdt_timeout_cfg wdt_config = {
-        .window.min = 0U,
-        .window.max = WATCHDOG_TIMEOUT_MS,
-        .flags = WDT_FLAG_RESET_SOC,
-        .callback = NULL
+        .window.min = 0U, .window.max = 30000U,
+        .flags = WDT_FLAG_RESET_SOC, .callback = NULL
     };
     wdt_channel_id = wdt_install_timeout(wdt, &wdt_config);
     wdt_setup(wdt, 0);
 }
 
 static void watchdog_feed(void) {
-    if (!is_skip_wdt && wdt && device_is_ready(wdt)) wdt_feed(wdt, wdt_channel_id);
-}
-
-// ---------------- MAIN ---------------- //
-
-int main(void)
-{
-    printk("System Booting... FSM v3.1 (Polled SBC Detect)\n");
-
-    // Init Hardware
-    if (gpio_is_ready_dt(&led0)) gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
-    if (gpio_is_ready_dt(&trigger_pin)) gpio_pin_configure_dt(&trigger_pin, GPIO_OUTPUT_INACTIVE);
-    if (gpio_is_ready_dt(&pwrkey_pin)) gpio_pin_configure_dt(&pwrkey_pin, GPIO_OUTPUT_INACTIVE);
-    
-    if (gpio_is_ready_dt(&button)) {
-        gpio_pin_configure_dt(&button, GPIO_INPUT | GPIO_PULL_UP);
-        gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-        gpio_init_callback(&button_callback_data, button_pressed_callback, BIT(button.pin));
-        gpio_add_callback(button.port, &button_callback_data);
+    if (!is_skip_wdt && wdt_channel_id >= 0 && device_is_ready(wdt)) {
+        wdt_feed(wdt, wdt_channel_id);
     }
-    if (gpio_is_ready_dt(&button3)) {
-        gpio_pin_configure_dt(&button3, GPIO_INPUT | GPIO_PULL_UP);
-        gpio_pin_interrupt_configure_dt(&button3, GPIO_INT_EDGE_TO_ACTIVE);
-        gpio_init_callback(&button3_callback_data, button3_pressed_callback, BIT(button3.pin));
-        gpio_add_callback(button3.port, &button3_callback_data);
-    }
-
-    if (gpio_is_ready_dt(&sbc_handoff)) {
-        gpio_pin_configure_dt(&sbc_handoff, GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(&sbc_handoff, GPIO_INT_EDGE_BOTH);
-        gpio_init_callback(&sbc_handoff_cb_data, sbc_handoff_callback, BIT(sbc_handoff.pin));
-        gpio_add_callback(sbc_handoff.port, &sbc_handoff_cb_data);
-        
-        // Initial check
-        if (gpio_pin_get_dt(&sbc_handoff) == 1) flag_sbc_request_active = true;
-    }
-
-    // Init UART
-    if (!device_is_ready(uart0)) return 0;
-    uart_callback_set(uart0, uart_event_callback, NULL);
-    uart_rx_enable(uart0, rx_ping, RX_BUF_SIZE, RX_TIMEOUT_DELAY);
-
-    // Read and Clear Reset Reason
-    stats.reset_reason = NRF_POWER->RESETREAS;
-    NRF_POWER->RESETREAS = 0xFFFFFFFF;
-    
-    if ((stats.reset_reason & NRF_POWER_RESETREAS_OFF_MASK) == 0) {
-        memset(&http_state, 0, sizeof(http_state));
-        memset(&uart_state, 0, sizeof(uart_state));
-    }
-
-    watchdog_init();
-
-    // Start in INIT state to decide logic
-    current_state = STATE_INIT;
-
-    while(1) {
-        
-        // GLOBAL SBC CHECK
-        if (flag_sbc_request_active && current_state != STATE_SBC_OWNED) {
-            printk("!!! SBC INTERRUPT !!! Switching to SBC_OWNED\n");
-            cleanup_http_session(); 
-            current_state = STATE_SBC_OWNED;
-        }
-
-        watchdog_feed();
-
-        switch (current_state) {
-            case STATE_INIT:
-                current_state = run_init();
-                break;
-            case STATE_RECOVERY:
-                current_state = run_recovery();
-                break;
-            case STATE_HARD_RESET:
-                current_state = run_hard_reset();
-                break;
-            case STATE_NET_SETUP:
-                current_state = run_net_setup();
-                break;
-            case STATE_HTTPS_SETUP:
-                current_state = run_https_setup();
-                break;
-            case STATE_POLLING_ACTIVE:
-                current_state = run_polling_active();
-                break;
-            case STATE_POLLING_IDLE:
-                for (int i = 0; i < POLL_INTERVAL_SEC * 10; i++) {
-                    if (flag_sbc_request_active) break;
-                    
-                    // FALLBACK: Polled check in case Interrupt missed
-                    if (gpio_pin_get_dt(&sbc_handoff) == 1) {
-                        flag_sbc_request_active = true;
-                        break;
-                    }
-
-                    k_msleep(100);
-                    watchdog_feed();
-                }
-                if (!flag_sbc_request_active) current_state = STATE_POLLING_ACTIVE;
-                break;
-            case STATE_SBC_OWNED:
-                // Exit only if pin goes LOW
-                if (gpio_pin_get_dt(&sbc_handoff) == 0) {
-                    // Debounce exit slightly
-                    k_msleep(100);
-                    if (gpio_pin_get_dt(&sbc_handoff) == 0) {
-                        flag_sbc_request_active = false;
-                        current_state = STATE_SBC_RECLAIM;
-                    }
-                }
-                k_msleep(100);
-                break;
-            case STATE_SBC_RECLAIM:
-                current_state = run_sbc_reclaim();
-                break;
-            default:
-                current_state = STATE_HARD_RESET;
-                break;
-        }
-    }
-    return 0;
 }
