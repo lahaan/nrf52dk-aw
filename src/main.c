@@ -1,9 +1,7 @@
 /*
-    FSM-v2.1LPE 
-        superfast edition
-        *handoff x true deep sleep x https x fast setup x pwrkey x fallback (basic) x wdt (basic) x STABLE x UX logging 
-        TESTED - near v1.3-121125 functionality parity achieved* with -1200loc
-    21/11/2025    *fixed potential SHCONN hangs, 2h+ uptime stable tested, wdt should work now* 
+    FSM-v2.2LPE
+     PSM-enabled [untested somewhat]; based on v2.1, ofc
+     date: 24/11/25
 */
 
 #include <zephyr/kernel.h>
@@ -27,11 +25,17 @@
 #define RX_TIMEOUT_DELAY            500     
 
 // TIMING
-#define PWRKEY_PRESS_MS             1100
+#define PWRKEY_PRESS_MS             1100    // For turning ON/OFF
+#define PWRKEY_WAKE_MS              250     // Short pulse to wake from PSM
 #define MODEM_BOOT_WAIT_SEC         6       
 #define POLL_INTERVAL_SEC           10
 #define MAX_CONSECUTIVE_FAILS       3       
 #define MAX_HARD_RESETS             3       
+#define MAGIC_CODE                  0xDEADBEEF
+
+// POWER SAVING
+#define PSM_SETTINGS                "1,,,\"00100001\",\"00000000\"" // 1h TAU [ref: t3324, t3412]
+#define EDRX_SETTINGS               "1,4,\"0010\""
 
 // SERVER
 #define SERVER_HOST                 "seven080-mcu-backend.onrender.com"
@@ -50,7 +54,7 @@ static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin
 static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
 static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 
-// ---------------- DATA ---------------- //
+// ---------------- DATA & RETENTION ---------------- //
 
 typedef enum {
     STATE_BOOT_WAIT,
@@ -60,13 +64,13 @@ typedef enum {
     STATE_NET_SETUP,
     STATE_HTTPS_SETUP,
     STATE_POLLING,
+    STATE_SBC_PREP,
     STATE_SBC_OWNED,
     STATE_RECOVERY,
     STATE_HARD_RESET
 } machine_state_t;
 
 typedef struct {
-    bool is_connected;
     bool is_session_active;
     int last_status_code;
     int last_data_size;
@@ -74,13 +78,21 @@ typedef struct {
 
 static http_state_t http_state;
 
+// RETAINED MEMORY (Survives Sleep/WDT)
+typedef struct {
+    uint32_t magic;
+    bool psm_active; // <--- THE CRITICAL FLAG
+} retained_data_t;
+
+static __attribute__((section(".noinit"))) retained_data_t retained;
+
 // GLOBALS
 static machine_state_t current_state = STATE_BOOT_WAIT;
 static int wdt_channel_id = -1;
 static bool is_skip_wdt = false;
 static bool flag_start_network = false;
 static bool flag_sbc_active = false;
-static volatile bool flag_modem_brownout = false; // ISR Flag
+static volatile bool flag_modem_brownout = false; 
 
 // COUNTERS
 static int consecutive_fails = 0;
@@ -135,17 +147,11 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
                 response_buffer[response_len] = '\0';
             }
         }
-        
-        // BROWNOUT DETECTION
-        // If modem resets, it sends "RDY" or "NORMAL POWER DOWN"
         if (strstr(response_buffer, "RDY") || strstr(response_buffer, "POWER DOWN")) {
             flag_modem_brownout = true;
-            response_complete = true; // Force exit
+            response_complete = true; 
         }
-
-        if (strstr(response_buffer, "OK\r\n") || 
-            strstr(response_buffer, "ERROR") || 
-            strstr(response_buffer, "+CME ERROR")) {
+        if (strstr(response_buffer, "OK\r\n") || strstr(response_buffer, "ERROR") || strstr(response_buffer, "+CME ERROR")) {
             response_complete = true;
         }
         if (strstr(response_buffer, "+SHREQ:")) {
@@ -181,20 +187,17 @@ bool send_at(const char *cmd, k_timeout_t timeout) {
     response_len = 0;
     response_buffer[0] = '\0';
     response_complete = false;
-    flag_modem_brownout = false; // Reset flag
+    flag_modem_brownout = false; 
 
     for(int i=0; cmd[i]; i++) uart_poll_out(uart0, cmd[i]);
     uart_poll_out(uart0, '\r');
 
     int64_t start = k_uptime_get();
     while ((k_uptime_get() - start) < timeout.ticks) {
-        
-        // INSTANT FAIL ON BROWNOUT
         if (flag_modem_brownout) {
             printk(" -> MODEM RESET DETECTED!\n");
             return false; 
         }
-
         if (response_complete) {
             bool ok = (strstr(response_buffer, "OK") != NULL);
             printk(" -> %s\n", ok ? "OK" : "ERR");
@@ -228,7 +231,7 @@ void execute_command(const char *raw) {
         gpio_pin_set_dt(&trigger_pin, 0); 
         k_msleep(250);
         gpio_pin_set_dt(&trigger_pin, 1); 
-        current_state = STATE_SBC_OWNED;
+        current_state = STATE_SBC_PREP; 
     }
 }
 
@@ -257,11 +260,20 @@ machine_state_t run_init(void) {
         printk("Wake from Sleep -> RECOVERY\n");
         return STATE_RECOVERY;
     }
+    
+    // Reset Retention if Cold Boot
+    if (retained.magic != MAGIC_CODE) {
+        printk("Cold Boot -> Clearing Retention\n");
+        retained.magic = MAGIC_CODE;
+        retained.psm_active = false; // Assume default
+    } else {
+        printk("Retained State: PSM=%d\n", retained.psm_active);
+    }
+
     if (rr & NRF_POWER_RESETREAS_DOG_MASK) {
         printk("WDT Reset -> CHECK MODEM\n");
         return STATE_CHECK_MODEM; 
     }
-    printk("Cold Boot -> IDLE\n");
     return STATE_IDLE;
 }
 
@@ -276,17 +288,35 @@ machine_state_t run_idle(void) {
 }
 
 machine_state_t run_check_modem(void) {
-    printk("--- CHECK MODEM (Strikes: %d/3) ---\n", consecutive_fails);
+    printk("--- CHECK MODEM (Strikes: %d) ---\n", consecutive_fails);
     
     if (consecutive_fails >= MAX_CONSECUTIVE_FAILS) {
-        printk("Strikes Exceeded -> FORCE HARD RESET\n");
+        printk("Too many strikes -> FORCE HARD RESET\n");
         return STATE_HARD_RESET;
     }
 
     send_at("ATE0", K_MSEC(500)); 
     if (send_at("AT", K_MSEC(500))) return STATE_NET_SETUP;
     
-    printk("Modem Unresponsive -> HARD RESET\n");
+    // --- PSM WAKE STRATEGY ---
+    if (retained.psm_active) {
+        printk("Modem unresponsive but PSM was Active. Attempting WAKE pulse...\n");
+        gpio_pin_set_dt(&pwrkey_pin, 1);
+        k_sleep(K_MSEC(PWRKEY_WAKE_MS)); // 250ms Pulse to wake
+        gpio_pin_set_dt(&pwrkey_pin, 0);
+        
+        printk("Waiting 3s for wake...\n");
+        k_sleep(K_SECONDS(3));
+        
+        if (send_at("AT", K_MSEC(500))) {
+            printk("Modem Woke Up!\n");
+            // Note: Waking from PSM usually requires re-negotiation
+            return STATE_NET_SETUP; 
+        }
+    }
+    // -------------------------
+
+    printk("Modem Dead -> HARD RESET\n");
     return STATE_HARD_RESET;
 }
 
@@ -296,7 +326,7 @@ machine_state_t run_hard_reset(void) {
     if (hard_reset_count >= MAX_HARD_RESETS) {
         printk("CRITICAL FAILURE -> SYSTEM REBOOT\n");
         k_sleep(K_SECONDS(2));
-        NVIC_SystemReset();
+        sys_reboot(SYS_REBOOT_COLD);
     }
 
     gpio_pin_set_dt(&pwrkey_pin, 1);
@@ -311,6 +341,7 @@ machine_state_t run_hard_reset(void) {
     
     hard_reset_count++; 
     consecutive_fails = 0; 
+    retained.psm_active = false; // Reset state assumption
     
     if (send_at("AT", K_MSEC(500))) return STATE_NET_SETUP;
     return STATE_HARD_RESET;
@@ -320,8 +351,18 @@ machine_state_t run_net_setup(void) {
     printk("--- NET SETUP ---\n");
     
     send_at("AT+CMEE=2", K_MSEC(500));
-    send_at("AT+CGREG=1", K_MSEC(500));
     
+    send_at("AT+CFUN=0", K_SECONDS(5));
+
+    printk("Configuring LPE (PSM/eDRX)...\n");
+    char psm[64]; snprintf(psm, sizeof(psm), "AT+CPSMS=%s", PSM_SETTINGS);
+    if (send_at(psm, K_MSEC(500))) retained.psm_active = true; // MARK STATE
+    
+    char edrx[64]; snprintf(edrx, sizeof(edrx), "AT+CEDRXS=%s", EDRX_SETTINGS);
+    send_at(edrx, K_MSEC(500));
+
+    send_at("AT+CFUN=1", K_SECONDS(5));
+
     if (send_at("AT+CPIN?", K_MSEC(500))) {
         if (!strstr(response_buffer, "READY")) {
             printk("SIM Error\n");
@@ -332,7 +373,7 @@ machine_state_t run_net_setup(void) {
     printk("Waiting for Reg...\n");
     bool registered = false;
     for(int i=0; i<20; i++) {
-        if (flag_sbc_active) return STATE_SBC_OWNED;
+        if (flag_sbc_active) return STATE_SBC_PREP;
         if (send_at("AT+CGREG?", K_MSEC(500))) { 
             if (strstr(response_buffer, ",1") || strstr(response_buffer, ",5")) {
                 registered = true;
@@ -367,7 +408,6 @@ machine_state_t run_https_setup(void) {
     printk("--- HTTPS SETUP ---\n");
     
     send_at("AT+SHDISC", K_MSEC(500)); 
-    
     send_at("AT+CFSINIT", K_MSEC(500));
     char cmd[64]; snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"%s\",0,%d,5000", CA_CERT_FILE, ca_certificate_length);
     uart_poll_out(uart0, '\r'); k_msleep(100);
@@ -377,7 +417,6 @@ machine_state_t run_https_setup(void) {
     for(int i=0; i<ca_certificate_length; i++) uart_poll_out(uart0, ca_certificate[i]);
     k_msleep(500);
     send_at("AT+CFSTERM", K_MSEC(500));
-    
     snprintf(cmd, sizeof(cmd), "AT+CSSLCFG=\"convert\",2,\"%s\"", CA_CERT_FILE);
     send_at(cmd, K_SECONDS(2));
     send_at("AT+CSSLCFG=\"sslversion\",1,3", K_MSEC(500));
@@ -391,7 +430,6 @@ machine_state_t run_https_setup(void) {
     send_at("AT+SHCONF=\"BODYLEN\",1024", K_MSEC(500));
     send_at("AT+SHCONF=\"HEADERLEN\",350", K_MSEC(500));
     
-    // Connect: 15s with Brownout Detect
     if (send_at("AT+SHCONN", K_SECONDS(15))) {
         http_state.is_session_active = true;
         consecutive_fails = 0;
@@ -401,9 +439,7 @@ machine_state_t run_https_setup(void) {
 
     printk("HTTPS Fail -> Strike\n");
     consecutive_fails++; 
-    
-    // RECOVERY DELAY: Give power rail time to stabilize
-    printk("Power Rail Recovery (5s)...\n");
+    printk("Power Recovery (5s)...\n");
     k_sleep(K_SECONDS(5)); 
     
     return STATE_CHECK_MODEM;
@@ -425,10 +461,8 @@ machine_state_t run_polling(void) {
              watchdog_feed();
              k_msleep(50);
         }
-        
         if (http_state.last_status_code == 200) {
              consecutive_fails = 0; 
-             
              is_cmd_received = false;
              char read[32]; snprintf(read, sizeof(read), "AT+SHREAD=0,%d", http_state.last_data_size);
              send_at(read, K_SECONDS(2));
@@ -441,16 +475,28 @@ machine_state_t run_polling(void) {
     }
     
     for(int i=0; i<POLL_INTERVAL_SEC * 10; i++) {
-        if (flag_sbc_active) return STATE_SBC_OWNED;
+        if (flag_sbc_active) return STATE_SBC_PREP;
         k_msleep(100);
         watchdog_feed();
     }
     return STATE_POLLING;
 }
 
+machine_state_t run_sbc_prep(void) {
+    printk("--- PREPARING SBC HANDOFF ---\n");
+    send_at("AT+SHDISC", K_MSEC(500));
+    
+    // DISABLE LPE so SBC can use standard PPP
+    printk("Disabling LPE for SBC...\n");
+    send_at("AT+CPSMS=0", K_MSEC(500));
+    send_at("AT+CEDRXS=0", K_MSEC(500));
+    retained.psm_active = false; // MARK STATE
+    
+    return STATE_SBC_OWNED;
+}
+
 machine_state_t run_sbc_owned(void) {
     printk("--- SBC OWNED (SYSTEM OFF) ---\n");
-    send_at("AT+SHDISC", K_MSEC(500));
     nrf_gpio_cfg_sense_input(sbc_handoff.pin, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_LOW);
     gpio_pin_set_dt(&led0, 0);
     pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
@@ -506,8 +552,8 @@ int main(void) {
     uart_rx_enable(uart0, rx_buf, RX_BUF_SIZE, RX_TIMEOUT_DELAY);
 
     while(1) {
-        if (flag_sbc_active && current_state != STATE_SBC_OWNED && current_state != STATE_BOOT_WAIT) {
-            current_state = STATE_SBC_OWNED;
+        if (flag_sbc_active && current_state != STATE_SBC_OWNED && current_state != STATE_SBC_PREP && current_state != STATE_BOOT_WAIT) {
+            current_state = STATE_SBC_PREP;
         }
 
         switch(current_state) {
@@ -518,6 +564,7 @@ int main(void) {
             case STATE_NET_SETUP:   current_state = run_net_setup(); break;
             case STATE_HTTPS_SETUP: current_state = run_https_setup(); break;
             case STATE_POLLING:     current_state = run_polling(); break;
+            case STATE_SBC_PREP:    current_state = run_sbc_prep(); break;
             case STATE_SBC_OWNED:   current_state = run_sbc_owned(); break;
             case STATE_RECOVERY:    current_state = run_recovery(); break;
             case STATE_HARD_RESET:  current_state = run_hard_reset(); break;
