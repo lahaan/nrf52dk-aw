@@ -1,7 +1,10 @@
 /*
-    FSM-v2.2LPE
-     PSM-enabled [untested somewhat]; based on v2.1, ofc
-     date: 24/11/25
+    FSM-v2.2b 
+     PSM-enabled [Hardware Mux Aware]
+     - Fix: NO UART commands sent after SBC boot (prevents timeouts).
+     - Logic: "Clean Handoff" (CMD) configures modem BEFORE boot.
+     - Logic: "Dirty Handoff" (Manual) performs Blind Power Cycle to reset PSM.
+     date: 25/11/25
 */
 
 #include <zephyr/kernel.h>
@@ -25,8 +28,8 @@
 #define RX_TIMEOUT_DELAY            500     
 
 // TIMING
-#define PWRKEY_PRESS_MS             1100    // For turning ON/OFF
-#define PWRKEY_WAKE_MS              250     // Short pulse to wake from PSM
+#define PWRKEY_PRESS_MS             1200    // SIM7080: >1.0s for ON, >1.2s for OFF
+#define PWRKEY_WAKE_MS              1200    // Wake from PSM
 #define MODEM_BOOT_WAIT_SEC         6       
 #define POLL_INTERVAL_SEC           10
 #define MAX_CONSECUTIVE_FAILS       3       
@@ -34,7 +37,10 @@
 #define MAGIC_CODE                  0xDEADBEEF
 
 // POWER SAVING
-#define PSM_SETTINGS                "1,,,\"00100001\",\"00000000\"" // 1h TAU [ref: t3324, t3412]
+// TAU: 1h, Active Time: 12s.
+// Note: We DO NOT save this to NVRAM (AT&W). We want reboot to clear it.
+//Note: AT&W afaik isnt a realy command on SIM7080
+#define PSM_SETTINGS                "1,,,\"00100001\",\"00000110\"" 
 #define EDRX_SETTINGS               "1,4,\"0010\""
 
 // SERVER
@@ -78,10 +84,10 @@ typedef struct {
 
 static http_state_t http_state;
 
-// RETAINED MEMORY (Survives Sleep/WDT)
+// RETAINED MEMORY
 typedef struct {
     uint32_t magic;
-    bool psm_active; // <--- THE CRITICAL FLAG
+    bool psm_active; 
 } retained_data_t;
 
 static __attribute__((section(".noinit"))) retained_data_t retained;
@@ -92,6 +98,7 @@ static int wdt_channel_id = -1;
 static bool is_skip_wdt = false;
 static bool flag_start_network = false;
 static bool flag_sbc_active = false;
+static bool flag_clean_handoff = false; // Tracks if we pre-configured modem via CMD
 static volatile bool flag_modem_brownout = false; 
 
 // COUNTERS
@@ -204,7 +211,7 @@ bool send_at(const char *cmd, k_timeout_t timeout) {
             return ok;
         }
         watchdog_feed();
-        if (flag_sbc_active) return false;
+        if (flag_sbc_active && current_state != STATE_SBC_PREP) return false;
         k_msleep(10);
     }
     printk(" -> TIMEOUT\n");
@@ -227,10 +234,19 @@ void execute_command(const char *raw) {
     else if (strcmp(cmd, "LED_OFF") == 0) gpio_pin_set_dt(&led0, 0);
     else if (strcmp(cmd, "TOGGLE") == 0) gpio_pin_toggle_dt(&led0);
     else if (strcmp(cmd, "BOOT") == 0) {
+        printk("CMD BOOT: Cleaning Modem Config BEFORE Handoff...\n");
+        
+        // 1. Clean Configuration (While we still have UART)
+        send_at("AT+CPSMS=0", K_MSEC(1000));
+        send_at("AT+CEDRXS=0", K_MSEC(1000));
+        flag_clean_handoff = true; 
+
+        // 2. Boot SBC (This will switch MUX and kill UART)
         printk("Booting SBC...\n");
         gpio_pin_set_dt(&trigger_pin, 0); 
         k_msleep(250);
         gpio_pin_set_dt(&trigger_pin, 1); 
+        
         current_state = STATE_SBC_PREP; 
     }
 }
@@ -261,11 +277,10 @@ machine_state_t run_init(void) {
         return STATE_RECOVERY;
     }
     
-    // Reset Retention if Cold Boot
     if (retained.magic != MAGIC_CODE) {
         printk("Cold Boot -> Clearing Retention\n");
         retained.magic = MAGIC_CODE;
-        retained.psm_active = false; // Assume default
+        retained.psm_active = false; 
     } else {
         printk("Retained State: PSM=%d\n", retained.psm_active);
     }
@@ -291,18 +306,16 @@ machine_state_t run_check_modem(void) {
     printk("--- CHECK MODEM (Strikes: %d) ---\n", consecutive_fails);
     
     if (consecutive_fails >= MAX_CONSECUTIVE_FAILS) {
-        printk("Too many strikes -> FORCE HARD RESET\n");
         return STATE_HARD_RESET;
     }
 
     send_at("ATE0", K_MSEC(500)); 
     if (send_at("AT", K_MSEC(500))) return STATE_NET_SETUP;
     
-    // --- PSM WAKE STRATEGY ---
     if (retained.psm_active) {
-        printk("Modem unresponsive but PSM was Active. Attempting WAKE pulse...\n");
+        printk("Modem Sleeping (PSM). Waking...\n");
         gpio_pin_set_dt(&pwrkey_pin, 1);
-        k_sleep(K_MSEC(PWRKEY_WAKE_MS)); // 250ms Pulse to wake
+        k_sleep(K_MSEC(PWRKEY_WAKE_MS)); 
         gpio_pin_set_dt(&pwrkey_pin, 0);
         
         printk("Waiting 3s for wake...\n");
@@ -310,11 +323,9 @@ machine_state_t run_check_modem(void) {
         
         if (send_at("AT", K_MSEC(500))) {
             printk("Modem Woke Up!\n");
-            // Note: Waking from PSM usually requires re-negotiation
             return STATE_NET_SETUP; 
         }
     }
-    // -------------------------
 
     printk("Modem Dead -> HARD RESET\n");
     return STATE_HARD_RESET;
@@ -341,7 +352,7 @@ machine_state_t run_hard_reset(void) {
     
     hard_reset_count++; 
     consecutive_fails = 0; 
-    retained.psm_active = false; // Reset state assumption
+    retained.psm_active = false;
     
     if (send_at("AT", K_MSEC(500))) return STATE_NET_SETUP;
     return STATE_HARD_RESET;
@@ -353,22 +364,36 @@ machine_state_t run_net_setup(void) {
     send_at("AT+CMEE=2", K_MSEC(500));
     
     send_at("AT+CFUN=0", K_SECONDS(5));
+    k_msleep(1000);
+    
+    send_at("AT+CFUN=1", K_SECONDS(5));
+    
+    // Wait for SIM (Prevents CPIN ERROR)
+    bool sim_ready = false;
+    for(int i=0; i<10; i++) {
+        if(send_at("AT+CPIN?", K_MSEC(500))) {
+            if(strstr(response_buffer, "READY")) {
+                sim_ready = true;
+                break;
+            }
+        }
+        k_sleep(K_MSEC(500));
+    }
+    if(!sim_ready) printk("Warning: SIM not ready yet...\n");
 
+    // Configure LPE
     printk("Configuring LPE (PSM/eDRX)...\n");
+    k_sleep(K_SECONDS(2)); 
+    
     char psm[64]; snprintf(psm, sizeof(psm), "AT+CPSMS=%s", PSM_SETTINGS);
-    if (send_at(psm, K_MSEC(500))) retained.psm_active = true; // MARK STATE
+    if (send_at(psm, K_MSEC(1000))) {
+        retained.psm_active = true; 
+    } else {
+        printk("PSM Config Failed (Ignoring)\n");
+    }
     
     char edrx[64]; snprintf(edrx, sizeof(edrx), "AT+CEDRXS=%s", EDRX_SETTINGS);
-    send_at(edrx, K_MSEC(500));
-
-    send_at("AT+CFUN=1", K_SECONDS(5));
-
-    if (send_at("AT+CPIN?", K_MSEC(500))) {
-        if (!strstr(response_buffer, "READY")) {
-            printk("SIM Error\n");
-            k_sleep(K_SECONDS(1));
-        }
-    }
+    send_at(edrx, K_MSEC(1000));
 
     printk("Waiting for Reg...\n");
     bool registered = false;
@@ -408,6 +433,7 @@ machine_state_t run_https_setup(void) {
     printk("--- HTTPS SETUP ---\n");
     
     send_at("AT+SHDISC", K_MSEC(500)); 
+    
     send_at("AT+CFSINIT", K_MSEC(500));
     char cmd[64]; snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"%s\",0,%d,5000", CA_CERT_FILE, ca_certificate_length);
     uart_poll_out(uart0, '\r'); k_msleep(100);
@@ -482,15 +508,57 @@ machine_state_t run_polling(void) {
     return STATE_POLLING;
 }
 
+// ---------------- SBC PREP (NO UART COMMANDS) ---------------- //
+
 machine_state_t run_sbc_prep(void) {
     printk("--- PREPARING SBC HANDOFF ---\n");
-    send_at("AT+SHDISC", K_MSEC(500));
     
-    // DISABLE LPE so SBC can use standard PPP
-    printk("Disabling LPE for SBC...\n");
-    send_at("AT+CPSMS=0", K_MSEC(500));
-    send_at("AT+CEDRXS=0", K_MSEC(500));
-    retained.psm_active = false; // MARK STATE
+    if (flag_clean_handoff) {
+        // CASE 1: CMD BOOT initiated this.
+        // We already sent AT+CPSMS=0 via UART in execute_command.
+        // The modem is ON and Clean.
+        printk("Type: Clean Handoff (Configured via UART)\n");
+        // Just yield.
+    } else {
+        // CASE 2: Manual Button / External Wake.
+        // The MUX has already switched. We have NO UART.
+        // The modem likely has PSM=1 enabled from our MCU session.
+        // We MUST Power Cycle it blindly to reset volatile configuration to defaults.
+        printk("Type: Dirty Handoff (Manual/External)\n");
+        printk("Action: Blind Power Cycle to reset Modem Config...\n");
+
+        // Strategy: 
+        // 1. Pulse 1.2s. (If Sleep->Wake. If Active->Off).
+        // 2. Wait 5s.
+        // 3. Pulse 1.2s. (If it was Off -> On. If it Woke -> Off).
+        // 4. Wait 3s.
+        // 5. Pulse 1.2s. (Turn On).
+        // This effectively ensures we end up ON, regardless of start state.
+        // And if we were ON, we turned OFF (clearing RAM), then ON.
+        
+        // Step 1
+        gpio_pin_set_dt(&pwrkey_pin, 1);
+        k_sleep(K_MSEC(PWRKEY_PRESS_MS));
+        gpio_pin_set_dt(&pwrkey_pin, 0);
+        k_sleep(K_SECONDS(5));
+
+        // Step 2
+        gpio_pin_set_dt(&pwrkey_pin, 1);
+        k_sleep(K_MSEC(PWRKEY_PRESS_MS));
+        gpio_pin_set_dt(&pwrkey_pin, 0);
+        k_sleep(K_SECONDS(3));
+        
+        // Step 3 (Turn ON)
+        gpio_pin_set_dt(&pwrkey_pin, 1);
+        k_sleep(K_MSEC(PWRKEY_PRESS_MS));
+        gpio_pin_set_dt(&pwrkey_pin, 0);
+        
+        printk("Blind Reset Complete. Modem should be Fresh ON.\n");
+    }
+
+    k_sleep(K_SECONDS(1)); 
+    retained.psm_active = false; 
+    flag_clean_handoff = false; // Reset flag for next time
     
     return STATE_SBC_OWNED;
 }
@@ -507,10 +575,6 @@ machine_state_t run_sbc_owned(void) {
 machine_state_t run_recovery(void) {
     printk("--- RECOVERY ---\n");
     k_sleep(K_MSEC(1000));
-    uart_poll_out(uart0, '+'); k_sleep(K_MSEC(20));
-    uart_poll_out(uart0, '+'); k_sleep(K_MSEC(20));
-    uart_poll_out(uart0, '+'); k_sleep(K_MSEC(1000));
-    send_at("ATH", K_SECONDS(2));
     return STATE_CHECK_MODEM;
 }
 
