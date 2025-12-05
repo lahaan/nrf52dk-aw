@@ -1,10 +1,7 @@
 /*
-    FSM-v2.2b 
-     PSM-enabled [Hardware Mux Aware]
-     - Fix: NO UART commands sent after SBC boot (prevents timeouts).
-     - Logic: "Clean Handoff" (CMD) configures modem BEFORE boot.
-     - Logic: "Dirty Handoff" (Manual) performs Blind Power Cycle to reset PSM.
-     date: 25/11/25
+    FSM-v2.3c
+     PSM disabled before ALL handoffs (CMD + Manual) x Early detection of manual handoff before MUX switch x Adjusted polling interval
+     date: 05/12/25
 */
 
 #include <zephyr/kernel.h>
@@ -20,27 +17,22 @@
 #include <hal/nrf_power.h>
 #include <hal/nrf_gpio.h>
 
-// ---------------- CONFIGURATION ---------------- //
-
 #define BAUD_RATE                   921600
 #define RX_BUF_SIZE                 128     
 #define RESPONSE_BUF_SIZE           1024    
 #define RX_TIMEOUT_DELAY            500     
 
 // TIMING
-#define PWRKEY_PRESS_MS             1200    // SIM7080: >1.0s for ON, >1.2s for OFF
-#define PWRKEY_WAKE_MS              1200    // Wake from PSM
+#define PWRKEY_PRESS_MS             1200    
+#define PWRKEY_WAKE_MS              1200    
 #define MODEM_BOOT_WAIT_SEC         6       
-#define POLL_INTERVAL_SEC           10
+#define POLL_INTERVAL_SEC           8       
 #define MAX_CONSECUTIVE_FAILS       3       
 #define MAX_HARD_RESETS             3       
 #define MAGIC_CODE                  0xDEADBEEF
 
 // POWER SAVING
-// TAU: 1h, Active Time: 12s.
-// Note: We DO NOT save this to NVRAM (AT&W). We want reboot to clear it.
-//Note: AT&W afaik isnt a realy command on SIM7080
-#define PSM_SETTINGS                "1,,,\"00100001\",\"00000110\"" 
+#define PSM_SETTINGS                "1,,,\"00100001\",\"00010101\"" 
 #define EDRX_SETTINGS               "1,4,\"0010\""
 
 // SERVER
@@ -48,8 +40,6 @@
 #define SERVER_URL                  "https://" SERVER_HOST
 #define DEVICE_ID                   "device001"
 #define CA_CERT_FILE                "server_ca.cer"
-
-// ---------------- HARDWARE ---------------- //
 
 const struct device *uart0 = DEVICE_DT_GET(DT_NODELABEL(uart0));
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -59,8 +49,6 @@ static const struct gpio_dt_spec trigger_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trig
 static const struct gpio_dt_spec sbc_handoff = GPIO_DT_SPEC_GET(DT_ALIAS(wakepin), gpios);
 static const struct gpio_dt_spec pwrkey_pin = GPIO_DT_SPEC_GET_OR(DT_ALIAS(trigger1), gpios, {0});
 static const struct device *wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
-
-// ---------------- DATA & RETENTION ---------------- //
 
 typedef enum {
     STATE_BOOT_WAIT,
@@ -84,7 +72,7 @@ typedef struct {
 
 static http_state_t http_state;
 
-// RETAINED MEMORY
+// MEMORY RETENTION
 typedef struct {
     uint32_t magic;
     bool psm_active; 
@@ -98,7 +86,7 @@ static int wdt_channel_id = -1;
 static bool is_skip_wdt = false;
 static bool flag_start_network = false;
 static bool flag_sbc_active = false;
-static bool flag_clean_handoff = false; // Tracks if we pre-configured modem via CMD
+static bool flag_sbc_handoff_pending = false; // NEW: Early detection flag
 static volatile bool flag_modem_brownout = false; 
 
 // COUNTERS
@@ -138,11 +126,10 @@ const char ca_certificate[] =
 "-----END CERTIFICATE-----\n";
 const size_t ca_certificate_length = sizeof(ca_certificate) - 1;
 
-// ---------------- FORWARD DECLARATIONS ---------------- //
 static void watchdog_feed(void);
 static void watchdog_init(void);
+static bool disable_psm_and_edrx(void);
 
-// ---------------- UART PROCESSING ---------------- //
 
 static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data) {
     switch (evt->type) {
@@ -211,11 +198,47 @@ bool send_at(const char *cmd, k_timeout_t timeout) {
             return ok;
         }
         watchdog_feed();
-        if (flag_sbc_active && current_state != STATE_SBC_PREP) return false;
+        
+        // Emergency handoff check
+        if (flag_sbc_handoff_pending && current_state != STATE_SBC_PREP) {
+            printk(" -> HANDOFF PENDING, ABORTING\n");
+            return false;
+        }
+        
         k_msleep(10);
     }
     printk(" -> TIMEOUT\n");
     return false;
+}
+
+static bool disable_psm_and_edrx(void) {
+    printk(">>> Disabling PSM/eDRX before handoff...\n");
+    bool success = true;
+    
+    // Disable PSM
+    if (!send_at("AT+CPSMS=0", K_MSEC(1000))) {
+        printk("WARNING: Failed to disable PSM\n");
+        success = false;
+    }
+    
+    // Disable eDRX
+    if (!send_at("AT+CEDRXS=0", K_MSEC(1000))) {
+        printk("WARNING: Failed to disable eDRX\n");
+        success = false;
+    }
+    
+    // Verify PSM disable
+    if (send_at("AT+CPSMS?", K_MSEC(500))) {
+        if (strstr(response_buffer, "+CPSMS: 0")) {
+            printk(">>> PSM successfully disabled\n");
+            retained.psm_active = false;
+        } else {
+            printk("WARNING: PSM still active after disable attempt\n");
+            success = false;
+        }
+    }
+    
+    return success;
 }
 
 void execute_command(const char *raw) {
@@ -234,24 +257,22 @@ void execute_command(const char *raw) {
     else if (strcmp(cmd, "LED_OFF") == 0) gpio_pin_set_dt(&led0, 0);
     else if (strcmp(cmd, "TOGGLE") == 0) gpio_pin_toggle_dt(&led0);
     else if (strcmp(cmd, "BOOT") == 0) {
-        printk("CMD BOOT: Cleaning Modem Config BEFORE Handoff...\n");
+        printk("CMD BOOT: Pre-configuring modem for SBC...\n");
         
-        // 1. Clean Configuration (While we still have UART)
-        send_at("AT+CPSMS=0", K_MSEC(1000));
-        send_at("AT+CEDRXS=0", K_MSEC(1000));
-        flag_clean_handoff = true; 
-
-        // 2. Boot SBC (This will switch MUX and kill UART)
+        if (!disable_psm_and_edrx()) {
+            printk("ERROR: Failed to clean modem config!\n");
+            printk("Proceeding anyway, but SBC may inherit PSM...\n");
+        }
+        
+        // Boot SBC (This will switch MUX)
         printk("Booting SBC...\n");
         gpio_pin_set_dt(&trigger_pin, 0); 
         k_msleep(250);
         gpio_pin_set_dt(&trigger_pin, 1); 
         
-        current_state = STATE_SBC_PREP; 
+        flag_sbc_handoff_pending = true;
     }
 }
-
-// ---------------- FSM STATES ---------------- //
 
 machine_state_t run_boot_wait(void) {
     printk("--- BOOT WAIT (3s) ---\n");
@@ -368,7 +389,6 @@ machine_state_t run_net_setup(void) {
     
     send_at("AT+CFUN=1", K_SECONDS(5));
     
-    // Wait for SIM (Prevents CPIN ERROR)
     bool sim_ready = false;
     for(int i=0; i<10; i++) {
         if(send_at("AT+CPIN?", K_MSEC(500))) {
@@ -381,13 +401,14 @@ machine_state_t run_net_setup(void) {
     }
     if(!sim_ready) printk("Warning: SIM not ready yet...\n");
 
-    // Configure LPE
-    printk("Configuring LPE (PSM/eDRX)...\n");
+    // Configure PSM/eDRX
+    printk("Configuring PSM/eDRX...\n");
     k_sleep(K_SECONDS(2)); 
     
     char psm[64]; snprintf(psm, sizeof(psm), "AT+CPSMS=%s", PSM_SETTINGS);
     if (send_at(psm, K_MSEC(1000))) {
         retained.psm_active = true; 
+        printk("PSM enabled: TAU=1h, Active=30s\n");
     } else {
         printk("PSM Config Failed (Ignoring)\n");
     }
@@ -398,7 +419,7 @@ machine_state_t run_net_setup(void) {
     printk("Waiting for Reg...\n");
     bool registered = false;
     for(int i=0; i<20; i++) {
-        if (flag_sbc_active) return STATE_SBC_PREP;
+        if (flag_sbc_handoff_pending) return STATE_SBC_PREP;
         if (send_at("AT+CGREG?", K_MSEC(500))) { 
             if (strstr(response_buffer, ",1") || strstr(response_buffer, ",5")) {
                 registered = true;
@@ -500,71 +521,41 @@ machine_state_t run_polling(void) {
         }
     }
     
+    // Poll every 8s (fits within 30s active window)
     for(int i=0; i<POLL_INTERVAL_SEC * 10; i++) {
-        if (flag_sbc_active) return STATE_SBC_PREP;
+        if (flag_sbc_handoff_pending) return STATE_SBC_PREP;
         k_msleep(100);
         watchdog_feed();
     }
     return STATE_POLLING;
 }
 
-// ---------------- SBC PREP (NO UART COMMANDS) ---------------- //
-
 machine_state_t run_sbc_prep(void) {
     printk("--- PREPARING SBC HANDOFF ---\n");
     
-    if (flag_clean_handoff) {
-        // CASE 1: CMD BOOT initiated this.
-        // We already sent AT+CPSMS=0 via UART in execute_command.
-        // The modem is ON and Clean.
-        printk("Type: Clean Handoff (Configured via UART)\n");
-        // Just yield.
+    if (retained.psm_active) {
+        printk("WARNING: PSM still marked active!\n");
+        printk("Attempting emergency cleanup...\n");
+        
+        if (!disable_psm_and_edrx()) {
+            printk("ERROR: Final PSM disable failed!\n");
+            printk("SBC WILL INHERIT PSM SETTINGS!\n");
+            printk("Recommend: SBC should run keepalive script.\n");
+        }
     } else {
-        // CASE 2: Manual Button / External Wake.
-        // The MUX has already switched. We have NO UART.
-        // The modem likely has PSM=1 enabled from our MCU session.
-        // We MUST Power Cycle it blindly to reset volatile configuration to defaults.
-        printk("Type: Dirty Handoff (Manual/External)\n");
-        printk("Action: Blind Power Cycle to reset Modem Config...\n");
-
-        // Strategy: 
-        // 1. Pulse 1.2s. (If Sleep->Wake. If Active->Off).
-        // 2. Wait 5s.
-        // 3. Pulse 1.2s. (If it was Off -> On. If it Woke -> Off).
-        // 4. Wait 3s.
-        // 5. Pulse 1.2s. (Turn On).
-        // This effectively ensures we end up ON, regardless of start state.
-        // And if we were ON, we turned OFF (clearing RAM), then ON.
-        
-        // Step 1
-        gpio_pin_set_dt(&pwrkey_pin, 1);
-        k_sleep(K_MSEC(PWRKEY_PRESS_MS));
-        gpio_pin_set_dt(&pwrkey_pin, 0);
-        k_sleep(K_SECONDS(5));
-
-        // Step 2
-        gpio_pin_set_dt(&pwrkey_pin, 1);
-        k_sleep(K_MSEC(PWRKEY_PRESS_MS));
-        gpio_pin_set_dt(&pwrkey_pin, 0);
-        k_sleep(K_SECONDS(3));
-        
-        // Step 3 (Turn ON)
-        gpio_pin_set_dt(&pwrkey_pin, 1);
-        k_sleep(K_MSEC(PWRKEY_PRESS_MS));
-        gpio_pin_set_dt(&pwrkey_pin, 0);
-        
-        printk("Blind Reset Complete. Modem should be Fresh ON.\n");
+        printk("PSM confirmed disabled. Clean handoff.\n");
     }
-
-    k_sleep(K_SECONDS(1)); 
-    retained.psm_active = false; 
-    flag_clean_handoff = false; // Reset flag for next time
+    
+    k_sleep(K_SECONDS(1));
+    flag_sbc_handoff_pending = false;
     
     return STATE_SBC_OWNED;
 }
 
 machine_state_t run_sbc_owned(void) {
     printk("--- SBC OWNED (SYSTEM OFF) ---\n");
+    printk("MCU entering deep sleep. Wake on handoff pin LOW.\n");
+    
     nrf_gpio_cfg_sense_input(sbc_handoff.pin, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_LOW);
     gpio_pin_set_dt(&led0, 0);
     pm_device_action_run(uart0, PM_DEVICE_ACTION_SUSPEND);
@@ -573,24 +564,39 @@ machine_state_t run_sbc_owned(void) {
 }
 
 machine_state_t run_recovery(void) {
-    printk("--- RECOVERY ---\n");
+    printk("--- RECOVERY (SBC Released Control) ---\n");
     k_sleep(K_MSEC(1000));
+    
+    printk("Verifying modem state post-handoff...\n");
     return STATE_CHECK_MODEM;
+}
+
+void button_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    printk("Button pressed: Starting network\n");
+    flag_start_network = true;
+}
+
+void sbc_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    int pin_state = gpio_pin_get_dt(&sbc_handoff);
+    
+    if (pin_state == 1 && !flag_sbc_active && !flag_sbc_handoff_pending) {
+        printk("\n!!! URGENT: SBC HANDOFF DETECTED !!!\n");
+        
+        if (current_state != STATE_SBC_OWNED && current_state != STATE_SBC_PREP) {
+            printk("Emergency PSM cleanup in progress...\n");
+            disable_psm_and_edrx();
+        }
+        
+        flag_sbc_handoff_pending = true;
+    } else if (pin_state == 0) {
+        flag_sbc_active = false;
+    }
 }
 
 // ---------------- MAIN ---------------- //
 
-void button_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    flag_start_network = true;
-}
-void sbc_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    if (gpio_pin_get_dt(&sbc_handoff) == 1) flag_sbc_active = true;
-}
-
 int main(void) {
-    if (gpio_is_ready_dt(&trigger_pin)) {
-        gpio_pin_configure_dt(&trigger_pin, GPIO_OUTPUT_ACTIVE);
-    }
+    if (gpio_is_ready_dt(&trigger_pin)) gpio_pin_configure_dt(&trigger_pin, GPIO_OUTPUT_ACTIVE);
     if (gpio_is_ready_dt(&led0)) gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
     if (gpio_is_ready_dt(&pwrkey_pin)) gpio_pin_configure_dt(&pwrkey_pin, GPIO_OUTPUT_INACTIVE);
     
@@ -601,6 +607,7 @@ int main(void) {
         gpio_init_callback(&btn_cb, button_cb, BIT(button.pin));
         gpio_add_callback(button.port, &btn_cb);
     }
+    
     if (gpio_is_ready_dt(&button3)) gpio_pin_configure_dt(&button3, GPIO_INPUT | GPIO_PULL_UP);
     
     if (gpio_is_ready_dt(&sbc_handoff)) {
@@ -609,14 +616,24 @@ int main(void) {
         static struct gpio_callback sbc_data;
         gpio_init_callback(&sbc_data, sbc_cb, BIT(sbc_handoff.pin));
         gpio_add_callback(sbc_handoff.port, &sbc_data);
-        if (gpio_pin_get_dt(&sbc_handoff) == 1) flag_sbc_active = true;
+        
+        if (gpio_pin_get_dt(&sbc_handoff) == 1) {
+            printk("SBC already active on boot\n");
+            flag_sbc_active = true;
+        }
     }
 
     uart_callback_set(uart0, uart_cb, NULL);
     uart_rx_enable(uart0, rx_buf, RX_BUF_SIZE, RX_TIMEOUT_DELAY);
 
+    printk("PSM: TAU=1h, Active=30s\n");
+
     while(1) {
-        if (flag_sbc_active && current_state != STATE_SBC_OWNED && current_state != STATE_SBC_PREP && current_state != STATE_BOOT_WAIT) {
+        if (flag_sbc_handoff_pending && 
+            current_state != STATE_SBC_OWNED && 
+            current_state != STATE_SBC_PREP && 
+            current_state != STATE_BOOT_WAIT) {
+            printk(">>> Transitioning to SBC handoff\n");
             current_state = STATE_SBC_PREP;
         }
 
@@ -637,19 +654,43 @@ int main(void) {
         if (!is_skip_wdt && wdt_channel_id == -1 && current_state != STATE_BOOT_WAIT) {
             watchdog_init();
         }
+        
         watchdog_feed();
     }
+    
     return 0;
 }
 
 static void watchdog_init(void) {
-    if (is_skip_wdt) return;
+    if (is_skip_wdt) {
+        printk("WDT DISABLED\n");
+        return;
+    }
+    
+    if (!device_is_ready(wdt)) {
+        printk("ERROR: Watchdog not ready\n");
+        return;
+    }
+    
     struct wdt_timeout_cfg wdt_config = {
-        .window.min = 0U, .window.max = 30000U,
-        .flags = WDT_FLAG_RESET_SOC, .callback = NULL
+        .window.min = 0U, 
+        .window.max = 30000U,  // 30 second timeout
+        .flags = WDT_FLAG_RESET_SOC, 
+        .callback = NULL
     };
+    
     wdt_channel_id = wdt_install_timeout(wdt, &wdt_config);
-    wdt_setup(wdt, 0);
+    if (wdt_channel_id < 0) {
+        printk("ERROR: Failed to install WDT timeout\n");
+        return;
+    }
+    
+    if (wdt_setup(wdt, 0) < 0) {
+        printk("ERROR: Failed to setup WDT\n");
+        return;
+    }
+    
+    printk("Watchdog initialized: 30s timeout\n");
 }
 
 static void watchdog_feed(void) {
